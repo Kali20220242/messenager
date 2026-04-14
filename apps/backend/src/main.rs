@@ -1,27 +1,18 @@
+mod auth;
 mod config;
+mod error;
+mod handlers;
+mod state;
 
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use config::AppConfig;
-use serde::Serialize;
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use reqwest::Client;
+use sqlx::postgres::PgPoolOptions;
+use state::AppState;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
-
-#[derive(Clone)]
-struct AppState {
-    config: Arc<AppConfig>,
-    db: PgPool,
-}
-
-#[derive(Serialize)]
-struct HealthResponse<'a> {
-    service: &'a str,
-    status: &'a str,
-    supabase_url: String,
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,39 +25,21 @@ async fn main() -> Result<()> {
         .connect(&config.supabase_db_url)
         .await?;
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/ready", get(ready))
+    let state = AppState {
+        config: Arc::clone(&config),
+        db,
+        http: Client::new(),
+    };
+
+    let app = handlers::router(state)
         .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
-        .with_state(AppState {
-            config: Arc::clone(&config),
-            db,
-        });
+        .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(config.address).await?;
     info!("backend listening on {}", config.address);
     axum::serve(listener, app).await?;
+
     Ok(())
-}
-
-async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let payload = HealthResponse {
-        service: "messenger-backend",
-        status: "ok",
-        supabase_url: state.config.supabase_url.clone(),
-    };
-    (StatusCode::OK, Json(payload))
-}
-
-async fn ready(State(state): State<AppState>) -> impl IntoResponse {
-    match sqlx::query_scalar::<_, i64>("select 1")
-        .fetch_one(&state.db)
-        .await
-    {
-        Ok(_) => StatusCode::OK,
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
-    }
 }
 
 fn init_tracing() {

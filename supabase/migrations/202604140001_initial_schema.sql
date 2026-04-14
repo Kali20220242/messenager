@@ -2,7 +2,8 @@ create extension if not exists "pgcrypto";
 
 create table if not exists public.profiles (
     id uuid primary key references auth.users(id) on delete cascade,
-    username text unique not null,
+    username text unique,
+    phone_e164 text unique not null,
     display_name text,
     avatar_path text,
     created_at timestamptz not null default timezone('utc', now()),
@@ -13,6 +14,7 @@ create table if not exists public.chats (
     id uuid primary key default gen_random_uuid(),
     title text,
     is_group boolean not null default false,
+    dm_key text unique,
     created_by uuid not null references public.profiles(id) on delete cascade,
     created_at timestamptz not null default timezone('utc', now())
 );
@@ -57,6 +59,40 @@ create trigger trg_profiles_updated_at
 before update on public.profiles
 for each row
 execute function public.handle_profile_updated_at();
+
+create or replace function public.handle_auth_user_created()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+    insert into public.profiles (id, username, phone_e164, display_name)
+    values (
+        new.id,
+        case
+            when new.phone is null then null
+            else '+' || regexp_replace(new.phone, '\D', '', 'g')
+        end,
+        case
+            when new.phone is null then null
+            else '+' || regexp_replace(new.phone, '\D', '', 'g')
+        end,
+        null
+    )
+    on conflict (id) do update
+    set username = excluded.username,
+        phone_e164 = excluded.phone_e164;
+
+    return new;
+end;
+$$;
+
+drop trigger if exists trg_auth_user_created on auth.users;
+create trigger trg_auth_user_created
+after insert on auth.users
+for each row
+execute function public.handle_auth_user_created();
 
 drop trigger if exists trg_messages_updated_at on public.messages;
 create trigger trg_messages_updated_at
@@ -172,4 +208,3 @@ for update
 to authenticated
 using (sender_id = auth.uid())
 with check (sender_id = auth.uid());
-
