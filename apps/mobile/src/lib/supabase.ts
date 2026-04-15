@@ -5,7 +5,7 @@ import { secureStorage } from "./storage";
 
 export const supabase = createClient(
   env.EXPO_PUBLIC_SUPABASE_URL,
-  env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
+  env.EXPO_PUBLIC_SUPABASE_KEY,
   {
     auth: {
       autoRefreshToken: true,

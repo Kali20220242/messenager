@@ -4,13 +4,13 @@ mod error;
 mod handlers;
 mod state;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use config::AppConfig;
 use reqwest::Client;
 use sqlx::postgres::PgPoolOptions;
-use state::AppState;
+use state::{AppState, SearchRateLimiter};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 
@@ -29,6 +29,7 @@ async fn main() -> Result<()> {
         config: Arc::clone(&config),
         db,
         http: Client::new(),
+        search_rate_limiter: SearchRateLimiter::new(25, Duration::from_secs(60)),
     };
 
     let app = handlers::router(state)

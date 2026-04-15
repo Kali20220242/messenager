@@ -6,6 +6,7 @@ export type ScreenState =
   | "phone-auth"
   | "otp-verify"
   | "chat-list"
+  | "profile"
   | "search-user"
   | "chat";
 

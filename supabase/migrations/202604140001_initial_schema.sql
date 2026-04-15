@@ -67,13 +67,9 @@ security definer
 set search_path = public
 as $$
 begin
-    insert into public.profiles (id, username, phone_e164, display_name)
+    insert into public.profiles (id, phone_e164, display_name)
     values (
         new.id,
-        case
-            when new.phone is null then null
-            else '+' || regexp_replace(new.phone, '\D', '', 'g')
-        end,
         case
             when new.phone is null then null
             else '+' || regexp_replace(new.phone, '\D', '', 'g')
@@ -81,8 +77,7 @@ begin
         null
     )
     on conflict (id) do update
-    set username = excluded.username,
-        phone_e164 = excluded.phone_e164;
+    set phone_e164 = excluded.phone_e164;
 
     return new;
 end;
@@ -100,6 +95,7 @@ before update on public.messages
 for each row
 execute function public.handle_profile_updated_at();
 
+drop policy if exists "profiles_select_own_or_member" on public.profiles;
 create policy "profiles_select_own_or_member"
 on public.profiles
 for select
@@ -116,12 +112,14 @@ using (
     )
 );
 
+drop policy if exists "profiles_insert_self" on public.profiles;
 create policy "profiles_insert_self"
 on public.profiles
 for insert
 to authenticated
 with check (id = auth.uid());
 
+drop policy if exists "profiles_update_self" on public.profiles;
 create policy "profiles_update_self"
 on public.profiles
 for update
@@ -129,6 +127,7 @@ to authenticated
 using (id = auth.uid())
 with check (id = auth.uid());
 
+drop policy if exists "chats_select_members" on public.chats;
 create policy "chats_select_members"
 on public.chats
 for select
@@ -142,12 +141,14 @@ using (
     )
 );
 
+drop policy if exists "chats_insert_creator" on public.chats;
 create policy "chats_insert_creator"
 on public.chats
 for insert
 to authenticated
 with check (created_by = auth.uid());
 
+drop policy if exists "chat_members_select_members" on public.chat_members;
 create policy "chat_members_select_members"
 on public.chat_members
 for select
@@ -161,6 +162,7 @@ using (
     )
 );
 
+drop policy if exists "chat_members_insert_self_or_creator" on public.chat_members;
 create policy "chat_members_insert_self_or_creator"
 on public.chat_members
 for insert
@@ -175,6 +177,7 @@ with check (
     )
 );
 
+drop policy if exists "messages_select_members" on public.messages;
 create policy "messages_select_members"
 on public.messages
 for select
@@ -188,6 +191,7 @@ using (
     )
 );
 
+drop policy if exists "messages_insert_sender_member" on public.messages;
 create policy "messages_insert_sender_member"
 on public.messages
 for insert
@@ -202,6 +206,7 @@ with check (
     )
 );
 
+drop policy if exists "messages_update_sender" on public.messages;
 create policy "messages_update_sender"
 on public.messages
 for update

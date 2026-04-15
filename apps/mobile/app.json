@@ -18,8 +18,20 @@
       }
     },
     "plugins": [
-      "expo-secure-store"
+      "expo-secure-store",
+      "expo-notifications",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow Messenger to access your photos so you can update your avatar."
+        }
+      ],
+      [
+        "expo-contacts",
+        {
+          "contactsPermission": "Allow Messenger to access your contacts to discover people already using the app."
+        }
+      ]
     ]
   }
 }
-

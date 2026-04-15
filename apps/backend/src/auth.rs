@@ -30,6 +30,7 @@ pub async fn require_auth(
     let token = bearer_token(request.headers())?;
     let user = fetch_current_user(&state, token).await?;
     sync_profile(&state.db, &user).await?;
+    touch_presence(&state.db, user.id).await?;
     request.extensions_mut().insert(user);
     Ok(next.run(request).await)
 }
@@ -53,7 +54,7 @@ async fn fetch_current_user(state: &AppState, token: &str) -> Result<CurrentUser
     let response = state
         .http
         .get(url)
-        .header("apikey", &state.config.supabase_publishable_key)
+        .header("apikey", &state.config.supabase_auth_key)
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .send()
         .await
@@ -79,7 +80,7 @@ async fn fetch_current_user(state: &AppState, token: &str) -> Result<CurrentUser
 
     Ok(CurrentUser {
         id: user.id,
-        phone_e164: user.phone,
+        phone_e164: user.phone.as_deref().map(canonical_phone),
     })
 }
 
@@ -91,11 +92,10 @@ async fn sync_profile(db: &PgPool, user: &CurrentUser) -> Result<(), ApiError> {
 
     sqlx::query(
         r#"
-        insert into public.profiles (id, username, phone_e164, display_name)
-        values ($1, $2, $2, null)
+        insert into public.profiles (id, phone_e164, display_name)
+        values ($1, $2, null)
         on conflict (id) do update
-        set username = excluded.username,
-            phone_e164 = excluded.phone_e164
+        set phone_e164 = excluded.phone_e164
         "#,
     )
     .bind(user.id)
@@ -106,7 +106,22 @@ async fn sync_profile(db: &PgPool, user: &CurrentUser) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn canonical_phone(value: &str) -> String {
+async fn touch_presence(db: &PgPool, user_id: Uuid) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        update public.profiles
+        set last_seen_at = timezone('utc', now())
+        where id = $1
+        "#,
+    )
+    .bind(user_id)
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+pub(crate) fn canonical_phone(value: &str) -> String {
     let digits: String = value.chars().filter(|char| char.is_ascii_digit()).collect();
 
     if digits.is_empty() {
@@ -114,4 +129,52 @@ fn canonical_phone(value: &str) -> String {
     } else {
         format!("+{digits}")
     }
+}
+
+pub async fn rate_limit_search(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let key = search_rate_limit_key(request.headers());
+
+    if let Some(retry_after_seconds) = state.search_rate_limiter.check(&key).await {
+        return Err(ApiError::Status(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("search rate limit exceeded; retry in {retry_after_seconds}s"),
+        ));
+    }
+
+    Ok(next.run(request).await)
+}
+
+fn search_rate_limit_key(headers: &HeaderMap) -> String {
+    if let Ok(token) = bearer_token(headers) {
+        return format!("bearer:{token}");
+    }
+
+    if let Some(value) = header_value(headers, "x-forwarded-for") {
+        let forwarded = value
+            .split(',')
+            .next()
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .unwrap_or("unknown");
+        return format!("ip:{forwarded}");
+    }
+
+    if let Some(value) = header_value(headers, "x-real-ip") {
+        return format!("ip:{value}");
+    }
+
+    "unknown".to_string()
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }

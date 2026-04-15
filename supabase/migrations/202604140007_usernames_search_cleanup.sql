@@ -1,24 +1,14 @@
-alter table public.profiles
-    add column if not exists phone_e164 text;
+update public.profiles
+set username = null
+where username is not null
+  and (
+    trim(username) = ''
+    or username = phone_e164
+  );
 
-update public.profiles profiles
-set phone_e164 = users.phone
-from auth.users users
-where users.id = profiles.id
-  and profiles.phone_e164 is null
-  and users.phone is not null;
-
-alter table public.profiles
-    alter column username drop not null;
-
-create unique index if not exists idx_profiles_phone_e164
-    on public.profiles (phone_e164);
-
-alter table public.chats
-    add column if not exists dm_key text;
-
-create unique index if not exists idx_chats_dm_key
-    on public.chats (dm_key);
+update public.profiles
+set username = lower(trim(username))
+where username is not null;
 
 create or replace function public.handle_auth_user_created()
 returns trigger

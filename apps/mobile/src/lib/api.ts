@@ -1,16 +1,26 @@
 import { env } from "./env";
 import { supabase } from "./supabase";
 
+export type ReceiptStatus = "sent" | "delivered" | "seen";
+
 export type UserProfile = {
   id: string;
   phone_e164: string;
+  username: string | null;
+  avatar_path: string | null;
+  last_seen_at: string | null;
+  is_online: boolean;
 };
+
+export type MeProfile = UserProfile;
 
 export type ChatSummary = {
   id: string;
   peer: UserProfile;
   last_message: string | null;
   last_message_at: string | null;
+  activity_at: string;
+  unread_count: number;
 };
 
 export type ChatMessage = {
@@ -20,10 +30,14 @@ export type ChatMessage = {
   body: string;
   created_at: string;
   updated_at: string;
+  receipt_status?: ReceiptStatus | null;
 };
 
+type ApiMethod = "GET" | "POST" | "PATCH" | "DELETE";
+export type ClearChatScope = "self_only" | "everyone";
+
 type ApiRequestInit = {
-  method?: "GET" | "POST";
+  method?: ApiMethod;
   query?: Record<string, string | number | undefined>;
   body?: unknown;
 };
@@ -85,7 +99,7 @@ async function apiRequest<T>(
         message = payload.error;
       }
     } catch {
-      // Fall back to the status message when the body is not JSON.
+      // Use fallback status-based message.
     }
 
     if (response.status === 401 && allowRetry && isInvalidBearerToken(message)) {
@@ -102,20 +116,69 @@ async function apiRequest<T>(
     throw new Error(message);
   }
 
+  if (response.status === 204) {
+    return undefined as T;
+  }
+
   return (await response.json()) as T;
 }
 
 export function fetchMe() {
-  return apiRequest<UserProfile>("/me");
+  return apiRequest<MeProfile>("/me");
 }
 
-export function fetchChats() {
-  return apiRequest<ChatSummary[]>("/chats");
+export function updateMyProfile(payload: { username?: string | null; avatar_path?: string | null }) {
+  return apiRequest<MeProfile>("/me", {
+    method: "PATCH",
+    body: payload,
+  });
 }
 
-export function searchUserByPhone(phone: string) {
-  return apiRequest<UserProfile>("/users/search", {
-    query: { phone },
+export function sendHeartbeat() {
+  return apiRequest<void>("/presence/heartbeat", {
+    method: "POST",
+  });
+}
+
+export function upsertPushToken(expoPushToken: string, platform: "ios" | "android" | "web") {
+  return apiRequest<void>("/devices/push-token", {
+    method: "POST",
+    body: {
+      expo_push_token: expoPushToken,
+      platform,
+    },
+  });
+}
+
+export function removePushToken(expoPushToken: string, platform: "ios" | "android" | "web") {
+  return apiRequest<void>("/devices/push-token/remove", {
+    method: "POST",
+    body: {
+      expo_push_token: expoPushToken,
+      platform,
+    },
+  });
+}
+
+export function fetchChats(before?: string, limit = 30) {
+  return apiRequest<ChatSummary[]>("/chats", {
+    query: {
+      before,
+      limit,
+    },
+  });
+}
+
+export function searchUserByUsername(username: string) {
+  return apiRequest<UserProfile[]>("/users/search", {
+    query: { username },
+  });
+}
+
+export function discoverContacts(phones: string[]) {
+  return apiRequest<UserProfile[]>("/contacts/discover", {
+    method: "POST",
+    body: { phones },
   });
 }
 
@@ -125,6 +188,19 @@ export function openDirectChat(peerUserId: string) {
     body: {
       peer_user_id: peerUserId,
     },
+  });
+}
+
+export function deleteChat(chatId: string) {
+  return apiRequest<void>(`/chats/${chatId}`, {
+    method: "DELETE",
+  });
+}
+
+export function clearChatHistory(chatId: string, scope: ClearChatScope) {
+  return apiRequest<void>(`/chats/${chatId}/clear`, {
+    method: "POST",
+    body: { scope },
   });
 }
 

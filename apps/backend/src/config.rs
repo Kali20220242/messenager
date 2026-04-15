@@ -7,7 +7,7 @@ pub struct AppConfig {
     pub address: SocketAddr,
     pub supabase_url: String,
     pub supabase_db_url: String,
-    pub supabase_publishable_key: String,
+    pub supabase_auth_key: String,
 }
 
 impl AppConfig {
@@ -21,8 +21,9 @@ impl AppConfig {
             env::var("SUPABASE_URL").context("SUPABASE_URL must be present in the environment")?;
         let supabase_db_url = env::var("SUPABASE_DB_URL")
             .context("SUPABASE_DB_URL must be present in the environment")?;
-        let supabase_publishable_key = env::var("SUPABASE_PUBLISHABLE_KEY")
-            .context("SUPABASE_PUBLISHABLE_KEY must be present in the environment")?;
+        let supabase_auth_key = env::var("SUPABASE_ANON_KEY")
+            .or_else(|_| env::var("SUPABASE_PUBLISHABLE_KEY"))
+            .context("SUPABASE_ANON_KEY or SUPABASE_PUBLISHABLE_KEY must be present in the environment")?;
 
         let address = format!("{host}:{port}")
             .parse::<SocketAddr>()
@@ -32,7 +33,7 @@ impl AppConfig {
             address,
             supabase_url,
             supabase_db_url,
-            supabase_publishable_key,
+            supabase_auth_key,
         })
     }
 }

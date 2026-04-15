@@ -9,3 +9,7 @@ export function normalizePhoneE164(input: string): string {
 
   return phone.number;
 }
+
+export function phoneDigits(input: string): string {
+  return input.replace(/\D/g, "");
+}
