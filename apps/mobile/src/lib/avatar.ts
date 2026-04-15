@@ -2,11 +2,14 @@ import { decode } from "base64-arraybuffer";
 import * as FileSystem from "expo-file-system/legacy";
 import * as ImagePicker from "expo-image-picker";
 import * as ImageManipulator from "expo-image-manipulator";
-
+import { Platform } from "react-native";
 import { supabase } from "./supabase";
+
 
 const AVATAR_BUCKET = "avatars";
 const AVATAR_OUTPUT_SIZE = 512;
+const AVATAR_SIGNED_URL_TTL_SECONDS = 60 * 60;
+const AVATAR_SIGNED_URL_REFRESH_WINDOW_MS = 60 * 1000;
 const SUPPORTED_INPUT_MIME_TYPES = new Set([
   "image/heic",
   "image/heif",
@@ -65,6 +68,7 @@ function buildCropAction(asset: ImagePicker.ImagePickerAsset) {
 }
 
 async function normalizeAvatarAsset(asset: ImagePicker.ImagePickerAsset) {
+
   const actions: ImageManipulator.Action[] = [];
   const crop = buildCropAction(asset);
 
@@ -78,18 +82,21 @@ async function normalizeAvatarAsset(asset: ImagePicker.ImagePickerAsset) {
       height: AVATAR_OUTPUT_SIZE,
     },
   });
-
   const normalized = await ImageManipulator.manipulateAsync(asset.uri, actions, {
     compress: 0.82,
     format: ImageManipulator.SaveFormat.JPEG,
   });
 
-  const base64 = await FileSystem.readAsStringAsync(normalized.uri, {
+  if (Platform.OS === "web"){
+    const response = await fetch(normalized.uri);
+    return await response.arrayBuffer();
+  } else {
+    const base64 = await FileSystem.readAsStringAsync(normalized.uri, {
     encoding: FileSystem.EncodingType.Base64,
   });
 
   return decode(base64);
-}
+}};
 
 export async function pickAndUploadAvatar(userId: string) {
   const result = await ImagePicker.launchImageLibraryAsync({
@@ -116,7 +123,7 @@ export async function pickAndUploadAvatar(userId: string) {
   const { error } = await supabase.storage.from(AVATAR_BUCKET).upload(filePath, fileBody, {
     cacheControl: "3600",
     contentType: "image/jpeg",
-    upsert: true,
+    upsert: false,
   });
 
   if (error) {
@@ -126,10 +133,50 @@ export async function pickAndUploadAvatar(userId: string) {
   return filePath;
 }
 
-export function getAvatarUrl(path: string | null | undefined) {
+const avatarUrlCache = new Map<string, { url: string; expiresAt: number }>();
+
+export async function resolveAvatarUrl(path: string | null | undefined) {
   if (!path) {
     return null;
   }
 
-  return supabase.storage.from(AVATAR_BUCKET).getPublicUrl(path).data.publicUrl;
+  const now = Date.now();
+  const cached = avatarUrlCache.get(path);
+
+  if (cached && cached.expiresAt - now > AVATAR_SIGNED_URL_REFRESH_WINDOW_MS) {
+    return cached.url;
+  }
+
+  const { data, error } = await supabase.storage
+    .from(AVATAR_BUCKET)
+    .createSignedUrl(path, AVATAR_SIGNED_URL_TTL_SECONDS);
+
+  if (error) {
+    throw error;
+  }
+
+  avatarUrlCache.set(path, {
+    url: data.signedUrl,
+    expiresAt: now + AVATAR_SIGNED_URL_TTL_SECONDS * 1000,
+  });
+
+  return data.signedUrl;
+}
+
+export async function removeAvatarFiles(paths: Array<string | null | undefined>) {
+  const uniquePaths = [...new Set(paths.map((path) => path?.trim()).filter(Boolean))] as string[];
+
+  if (!uniquePaths.length) {
+    return;
+  }
+
+  const { error } = await supabase.storage.from(AVATAR_BUCKET).remove(uniquePaths);
+
+  if (error) {
+    throw error;
+  }
+
+  for (const path of uniquePaths) {
+    avatarUrlCache.delete(path);
+  }
 }

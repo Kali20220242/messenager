@@ -49,7 +49,10 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
 }
 
 async fn fetch_current_user(state: &AppState, token: &str) -> Result<CurrentUser, ApiError> {
-    let url = format!("{}/auth/v1/user", state.config.supabase_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/auth/v1/user",
+        state.config.supabase_url.trim_end_matches('/')
+    );
 
     let response = state
         .http

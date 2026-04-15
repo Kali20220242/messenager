@@ -6,7 +6,7 @@ use axum::{
     http::StatusCode,
     middleware,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -94,6 +94,9 @@ struct ChatSummaryRow {
     last_message_at: Option<DateTime<Utc>>,
     activity_at: DateTime<Utc>,
     unread_count: i64,
+    is_archived: bool,
+    is_pinned: bool,
+    is_muted: bool,
 }
 
 #[derive(Serialize)]
@@ -104,6 +107,9 @@ struct ChatSummary {
     last_message_at: Option<DateTime<Utc>>,
     activity_at: DateTime<Utc>,
     unread_count: i64,
+    is_archived: bool,
+    is_pinned: bool,
+    is_muted: bool,
 }
 
 #[derive(Deserialize)]
@@ -127,7 +133,25 @@ struct MessageRecordRow {
     body: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    edited_at: Option<DateTime<Utc>>,
+    deleted_at: Option<DateTime<Utc>>,
     receipt_status: Option<String>,
+    reply_to_id: Option<Uuid>,
+    reply_to_sender_id: Option<Uuid>,
+    reply_to_body: Option<String>,
+    reply_to_deleted_at: Option<DateTime<Utc>>,
+    forwarded_from_id: Option<Uuid>,
+    forwarded_from_sender_id: Option<Uuid>,
+    forwarded_from_body: Option<String>,
+    forwarded_from_deleted_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct MessagePreview {
+    id: Uuid,
+    sender_id: Uuid,
+    body: String,
+    is_deleted: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -138,12 +162,18 @@ struct MessageRecord {
     body: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    edited_at: Option<DateTime<Utc>>,
+    deleted_at: Option<DateTime<Utc>>,
     receipt_status: Option<ReceiptStatus>,
+    reply_to: Option<MessagePreview>,
+    forwarded_from: Option<MessagePreview>,
 }
 
 #[derive(Deserialize)]
 struct SendMessageRequest {
     body: String,
+    reply_to_message_id: Option<Uuid>,
+    forwarded_from_message_id: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -159,6 +189,16 @@ struct PushTokenRequest {
 }
 
 #[derive(Deserialize)]
+struct UpdateMessageRequest {
+    body: String,
+}
+
+#[derive(Deserialize)]
+struct DeleteMessageRequest {
+    scope: DeleteMessageScope,
+}
+
+#[derive(Deserialize)]
 struct ClearChatRequest {
     scope: ClearChatScope,
 }
@@ -168,6 +208,20 @@ struct ClearChatRequest {
 enum ClearChatScope {
     SelfOnly,
     Everyone,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DeleteMessageScope {
+    SelfOnly,
+    Everyone,
+}
+
+#[derive(Deserialize)]
+struct UpdateChatPreferencesRequest {
+    archived: Option<bool>,
+    pinned: Option<bool>,
+    muted: Option<bool>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -186,13 +240,25 @@ pub fn router(state: AppState) -> Router {
         .route("/contacts/discover", post(discover_contacts))
         .route("/chats", get(list_chats))
         .route("/chats/{chat_id}", axum::routing::delete(delete_chat))
+        .route(
+            "/chats/{chat_id}/preferences",
+            patch(update_chat_preferences),
+        )
         .route("/chats/{chat_id}/clear", post(clear_chat_history))
         .route("/chats/direct", post(create_or_get_direct_chat))
-        .route("/chats/{chat_id}/messages", get(list_messages).post(send_message))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_auth,
-        ));
+        .route(
+            "/chats/{chat_id}/messages",
+            get(list_messages).post(send_message),
+        )
+        .route(
+            "/chats/{chat_id}/messages/{message_id}",
+            patch(edit_message),
+        )
+        .route(
+            "/chats/{chat_id}/messages/{message_id}/delete",
+            post(delete_message),
+        )
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     Router::new()
         .route("/health", get(health))
@@ -410,10 +476,17 @@ async fn list_chats(
             peer.username as peer_username,
             peer.avatar_path as peer_avatar_path,
             peer.last_seen_at as peer_last_seen_at,
-            lm.body as last_message,
+            case
+                when lm.deleted_at is not null then 'Message deleted'
+                else lm.body
+            end as last_message,
             lm.created_at as last_message_at,
             coalesce(lm.created_at, c.created_at) as activity_at,
-            coalesce(unread.unread_count, 0) as unread_count
+            coalesce(unread.unread_count, 0) as unread_count,
+            self_member.archived_at is not null as is_archived,
+            self_member.pinned_at is not null as is_pinned,
+            self_member.muted_until is not null
+                and self_member.muted_until > timezone('utc', now()) as is_muted
         from public.chats c
         join public.chat_members self_member
             on self_member.chat_id = c.id
@@ -424,9 +497,15 @@ async fn list_chats(
         join public.profiles peer
             on peer.id = peer_member.user_id
         left join lateral (
-            select m.body, m.created_at
+            select m.body, m.created_at, m.deleted_at
             from public.messages m
             where m.chat_id = c.id
+              and not exists (
+                  select 1
+                  from public.message_hidden_for_users hidden
+                  where hidden.message_id = m.id
+                    and hidden.user_id = $1
+              )
               and (
                   self_member.cleared_at is null
                   or m.created_at > self_member.cleared_at
@@ -439,6 +518,13 @@ async fn list_chats(
             from public.messages m
             where m.chat_id = c.id
               and m.sender_id <> $1
+              and m.deleted_at is null
+              and not exists (
+                  select 1
+                  from public.message_hidden_for_users hidden
+                  where hidden.message_id = m.id
+                    and hidden.user_id = $1
+              )
               and (
                   self_member.cleared_at is null
                   or m.created_at > self_member.cleared_at
@@ -504,6 +590,48 @@ async fn delete_chat(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn update_chat_preferences(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(chat_id): Path<Uuid>,
+    Json(payload): Json<UpdateChatPreferencesRequest>,
+) -> Result<Json<ChatSummary>, ApiError> {
+    ensure_chat_membership(&state.db, chat_id, user.id).await?;
+
+    sqlx::query(
+        r#"
+        update public.chat_members
+        set archived_at = case
+                when $3::bool is null then archived_at
+                when $3 then timezone('utc', now())
+                else null
+            end,
+            pinned_at = case
+                when $4::bool is null then pinned_at
+                when $4 then coalesce(pinned_at, timezone('utc', now()))
+                else null
+            end,
+            muted_until = case
+                when $5::bool is null then muted_until
+                when $5 then 'infinity'::timestamptz
+                else null
+            end
+        where chat_id = $1
+          and user_id = $2
+        "#,
+    )
+    .bind(chat_id)
+    .bind(user.id)
+    .bind(payload.archived)
+    .bind(payload.pinned)
+    .bind(payload.muted)
+    .execute(&state.db)
+    .await?;
+
+    let summary = fetch_chat_summary(&state.db, chat_id, user.id, None).await?;
+    Ok(Json(summary))
+}
+
 async fn clear_chat_history(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
@@ -535,7 +663,8 @@ async fn create_or_get_direct_chat(
     let dm_key = dm_key(user.id, payload.peer_user_id);
     let mut tx = state.db.begin().await?;
 
-    let chat_id = find_or_create_direct_chat(&mut tx, &dm_key, user.id, payload.peer_user_id).await?;
+    let chat_id =
+        find_or_create_direct_chat(&mut tx, &dm_key, user.id, payload.peer_user_id).await?;
     tx.commit().await?;
 
     let summary = fetch_chat_summary(&state.db, chat_id, user.id, Some(peer)).await?;
@@ -559,15 +688,36 @@ async fn list_messages(
             m.id,
             m.chat_id,
             m.sender_id,
-            m.body,
+            case
+                when m.deleted_at is not null then ''
+                else m.body
+            end as body,
             m.created_at,
             m.updated_at,
+            m.edited_at,
+            m.deleted_at,
             case
-                when m.sender_id <> $2 then null
+                when m.sender_id <> $2 or m.deleted_at is not null then null
                 when peer_member.last_read_at is not null and peer_member.last_read_at >= m.created_at then 'seen'
                 when peer_member.last_delivered_at is not null and peer_member.last_delivered_at >= m.created_at then 'delivered'
                 else 'sent'
-            end as receipt_status
+            end as receipt_status,
+            reply_msg.id as reply_to_id,
+            reply_msg.sender_id as reply_to_sender_id,
+            case
+                when reply_msg.id is null then null
+                when reply_msg.deleted_at is not null then 'Deleted message'
+                else reply_msg.body
+            end as reply_to_body,
+            reply_msg.deleted_at as reply_to_deleted_at,
+            forwarded_msg.id as forwarded_from_id,
+            forwarded_msg.sender_id as forwarded_from_sender_id,
+            case
+                when forwarded_msg.id is null then null
+                when forwarded_msg.deleted_at is not null then 'Deleted message'
+                else forwarded_msg.body
+            end as forwarded_from_body,
+            forwarded_msg.deleted_at as forwarded_from_deleted_at
         from public.messages m
         join public.chat_members self_member
             on self_member.chat_id = m.chat_id
@@ -575,7 +725,29 @@ async fn list_messages(
         left join public.chat_members peer_member
             on peer_member.chat_id = m.chat_id
            and peer_member.user_id <> $2
+        left join public.messages reply_msg
+            on reply_msg.id = m.reply_to_message_id
+           and not exists (
+               select 1
+               from public.message_hidden_for_users hidden
+               where hidden.message_id = reply_msg.id
+                 and hidden.user_id = $2
+           )
+        left join public.messages forwarded_msg
+            on forwarded_msg.id = m.forwarded_from_message_id
+           and not exists (
+               select 1
+               from public.message_hidden_for_users hidden
+               where hidden.message_id = forwarded_msg.id
+                 and hidden.user_id = $2
+           )
         where m.chat_id = $1
+          and not exists (
+              select 1
+              from public.message_hidden_for_users hidden
+              where hidden.message_id = m.id
+                and hidden.user_id = $2
+          )
           and (
               self_member.cleared_at is null
               or m.created_at > self_member.cleared_at
@@ -609,19 +781,58 @@ async fn send_message(
     Path(chat_id): Path<Uuid>,
     Json(payload): Json<SendMessageRequest>,
 ) -> Result<(StatusCode, Json<MessageRecord>), ApiError> {
-    let body = normalize_message_body(payload.body)?;
     ensure_chat_membership(&state.db, chat_id, user.id).await?;
+
+    let reply_to_message_id = match payload.reply_to_message_id {
+        Some(message_id) => {
+            Some(validate_reply_target(&state.db, chat_id, user.id, message_id).await?)
+        }
+        None => None,
+    };
+
+    let (body, forwarded_from_message_id) = match payload.forwarded_from_message_id {
+        Some(message_id) => {
+            let forwarded = validate_forward_source(&state.db, user.id, message_id).await?;
+            (forwarded.body, Some(forwarded.id))
+        }
+        None => (normalize_message_body(payload.body)?, None),
+    };
 
     let row = sqlx::query_as::<_, MessageRecordRow>(
         r#"
-        insert into public.messages (chat_id, sender_id, body)
-        values ($1, $2, $3)
-        returning id, chat_id, sender_id, body, created_at, updated_at, 'sent' as receipt_status
+        insert into public.messages (
+            chat_id,
+            sender_id,
+            body,
+            reply_to_message_id,
+            forwarded_from_message_id
+        )
+        values ($1, $2, $3, $4, $5)
+        returning
+            id,
+            chat_id,
+            sender_id,
+            body,
+            created_at,
+            updated_at,
+            edited_at,
+            deleted_at,
+            'sent' as receipt_status,
+            null::uuid as reply_to_id,
+            null::uuid as reply_to_sender_id,
+            null::text as reply_to_body,
+            null::timestamptz as reply_to_deleted_at,
+            null::uuid as forwarded_from_id,
+            null::uuid as forwarded_from_sender_id,
+            null::text as forwarded_from_body,
+            null::timestamptz as forwarded_from_deleted_at
         "#,
     )
     .bind(chat_id)
     .bind(user.id)
     .bind(body.clone())
+    .bind(reply_to_message_id)
+    .bind(forwarded_from_message_id)
     .fetch_one(&state.db)
     .await?;
 
@@ -631,7 +842,9 @@ async fn send_message(
     if !push_tokens.is_empty() {
         dispatch_push_notifications(
             state.http.clone(),
-            sender_profile.username.unwrap_or_else(|| canonical_phone(&sender_profile.phone_e164)),
+            sender_profile
+                .username
+                .unwrap_or_else(|| canonical_phone(&sender_profile.phone_e164)),
             body,
             chat_id,
             push_tokens,
@@ -639,6 +852,75 @@ async fn send_message(
     }
 
     Ok((StatusCode::CREATED, Json(to_message_record(row))))
+}
+
+async fn edit_message(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((chat_id, message_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<UpdateMessageRequest>,
+) -> Result<Json<MessageRecord>, ApiError> {
+    ensure_chat_membership(&state.db, chat_id, user.id).await?;
+    let body = normalize_message_body(payload.body)?;
+
+    let row = sqlx::query_as::<_, MessageRecordRow>(
+        r#"
+        update public.messages
+        set body = $4,
+            edited_at = timezone('utc', now())
+        where id = $1
+          and chat_id = $2
+          and sender_id = $3
+          and deleted_at is null
+        returning
+            id,
+            chat_id,
+            sender_id,
+            body,
+            created_at,
+            updated_at,
+            edited_at,
+            deleted_at,
+            'sent' as receipt_status,
+            null::uuid as reply_to_id,
+            null::uuid as reply_to_sender_id,
+            null::text as reply_to_body,
+            null::timestamptz as reply_to_deleted_at,
+            null::uuid as forwarded_from_id,
+            null::uuid as forwarded_from_sender_id,
+            null::text as forwarded_from_body,
+            null::timestamptz as forwarded_from_deleted_at
+        "#,
+    )
+    .bind(message_id)
+    .bind(chat_id)
+    .bind(user.id)
+    .bind(body)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("message not found".to_string()))?;
+
+    Ok(Json(to_message_record(row)))
+}
+
+async fn delete_message(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((chat_id, message_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<DeleteMessageRequest>,
+) -> Result<StatusCode, ApiError> {
+    ensure_chat_membership(&state.db, chat_id, user.id).await?;
+
+    match payload.scope {
+        DeleteMessageScope::SelfOnly => {
+            hide_message_for_user(&state.db, chat_id, message_id, user.id).await?
+        }
+        DeleteMessageScope::Everyone => {
+            delete_message_for_everyone(&state.db, chat_id, message_id, user.id).await?
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn profile_by_id(db: &PgPool, user_id: Uuid) -> Result<ProfileRecord, ApiError> {
@@ -741,6 +1023,147 @@ async fn mark_chat_read(
     .bind(last_message_id)
     .execute(db)
     .await?;
+
+    Ok(())
+}
+
+#[derive(FromRow)]
+struct ForwardSource {
+    id: Uuid,
+    body: String,
+}
+
+async fn validate_reply_target(
+    db: &PgPool,
+    chat_id: Uuid,
+    user_id: Uuid,
+    message_id: Uuid,
+) -> Result<Uuid, ApiError> {
+    let found = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        select m.id
+        from public.messages m
+        where m.id = $1
+          and m.chat_id = $2
+          and not exists (
+              select 1
+              from public.message_hidden_for_users hidden
+              where hidden.message_id = m.id
+                and hidden.user_id = $3
+          )
+        limit 1
+        "#,
+    )
+    .bind(message_id)
+    .bind(chat_id)
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?;
+
+    found.ok_or_else(|| ApiError::NotFound("reply target not found".to_string()))
+}
+
+async fn validate_forward_source(
+    db: &PgPool,
+    user_id: Uuid,
+    message_id: Uuid,
+) -> Result<ForwardSource, ApiError> {
+    sqlx::query_as::<_, ForwardSource>(
+        r#"
+        select m.id, m.body
+        from public.messages m
+        join public.chat_members cm
+            on cm.chat_id = m.chat_id
+           and cm.user_id = $2
+        where m.id = $1
+          and m.deleted_at is null
+          and not exists (
+              select 1
+              from public.message_hidden_for_users hidden
+              where hidden.message_id = m.id
+                and hidden.user_id = $2
+          )
+          and (
+              cm.cleared_at is null
+              or m.created_at > cm.cleared_at
+          )
+        limit 1
+        "#,
+    )
+    .bind(message_id)
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("forward source not found".to_string()))
+}
+
+async fn hide_message_for_user(
+    db: &PgPool,
+    chat_id: Uuid,
+    message_id: Uuid,
+    user_id: Uuid,
+) -> Result<(), ApiError> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        r#"
+        select exists(
+            select 1
+            from public.messages
+            where id = $1
+              and chat_id = $2
+        )
+        "#,
+    )
+    .bind(message_id)
+    .bind(chat_id)
+    .fetch_one(db)
+    .await?;
+
+    if !exists {
+        return Err(ApiError::NotFound("message not found".to_string()));
+    }
+
+    sqlx::query(
+        r#"
+        insert into public.message_hidden_for_users (message_id, user_id, chat_id)
+        values ($1, $2, $3)
+        on conflict (message_id, user_id) do nothing
+        "#,
+    )
+    .bind(message_id)
+    .bind(user_id)
+    .bind(chat_id)
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+async fn delete_message_for_everyone(
+    db: &PgPool,
+    chat_id: Uuid,
+    message_id: Uuid,
+    user_id: Uuid,
+) -> Result<(), ApiError> {
+    let updated = sqlx::query(
+        r#"
+        update public.messages
+        set deleted_at = coalesce(deleted_at, timezone('utc', now())),
+            edited_at = null
+        where id = $1
+          and chat_id = $2
+          and sender_id = $3
+        "#,
+    )
+    .bind(message_id)
+    .bind(chat_id)
+    .bind(user_id)
+    .execute(db)
+    .await?
+    .rows_affected();
+
+    if updated == 0 {
+        return Err(ApiError::NotFound("message not found".to_string()));
+    }
 
     Ok(())
 }
@@ -871,10 +1294,17 @@ async fn fetch_chat_summary(
             peer.username as peer_username,
             peer.avatar_path as peer_avatar_path,
             peer.last_seen_at as peer_last_seen_at,
-            lm.body as last_message,
+            case
+                when lm.deleted_at is not null then 'Message deleted'
+                else lm.body
+            end as last_message,
             lm.created_at as last_message_at,
             coalesce(lm.created_at, c.created_at) as activity_at,
-            0::bigint as unread_count
+            0::bigint as unread_count,
+            self_member.archived_at is not null as is_archived,
+            self_member.pinned_at is not null as is_pinned,
+            self_member.muted_until is not null
+                and self_member.muted_until > timezone('utc', now()) as is_muted
         from public.chats c
         join public.chat_members self_member
             on self_member.chat_id = c.id
@@ -885,9 +1315,15 @@ async fn fetch_chat_summary(
         join public.profiles peer
             on peer.id = peer_member.user_id
         left join lateral (
-            select m.body, m.created_at
+            select m.body, m.created_at, m.deleted_at
             from public.messages m
             where m.chat_id = c.id
+              and not exists (
+                  select 1
+                  from public.message_hidden_for_users hidden
+                  where hidden.message_id = m.id
+                    and hidden.user_id = $2
+              )
               and (
                   self_member.cleared_at is null
                   or m.created_at > self_member.cleared_at
@@ -913,6 +1349,9 @@ async fn fetch_chat_summary(
             last_message_at: row.last_message_at,
             activity_at: row.activity_at,
             unread_count: 0,
+            is_archived: row.is_archived,
+            is_pinned: row.is_pinned,
+            is_muted: row.is_muted,
         });
     }
 
@@ -932,6 +1371,10 @@ async fn fetch_push_tokens_for_chat(
             on cm.user_id = ud.user_id
         where cm.chat_id = $1
           and cm.user_id <> $2
+          and (
+              cm.muted_until is null
+              or cm.muted_until <= timezone('utc', now())
+          )
         "#,
     )
     .bind(chat_id)
@@ -1005,6 +1448,9 @@ fn to_chat_summary(row: ChatSummaryRow) -> ChatSummary {
         last_message_at: row.last_message_at,
         activity_at: row.activity_at,
         unread_count: row.unread_count.max(0),
+        is_archived: row.is_archived,
+        is_pinned: row.is_pinned,
+        is_muted: row.is_muted,
     }
 }
 
@@ -1016,8 +1462,36 @@ fn to_message_record(row: MessageRecordRow) -> MessageRecord {
         body: row.body,
         created_at: row.created_at,
         updated_at: row.updated_at,
+        edited_at: row.edited_at,
+        deleted_at: row.deleted_at,
         receipt_status: row.receipt_status.as_deref().and_then(parse_receipt_status),
+        reply_to: zip_message_preview(
+            row.reply_to_id,
+            row.reply_to_sender_id,
+            row.reply_to_body,
+            row.reply_to_deleted_at,
+        ),
+        forwarded_from: zip_message_preview(
+            row.forwarded_from_id,
+            row.forwarded_from_sender_id,
+            row.forwarded_from_body,
+            row.forwarded_from_deleted_at,
+        ),
     }
+}
+
+fn zip_message_preview(
+    id: Option<Uuid>,
+    sender_id: Option<Uuid>,
+    body: Option<String>,
+    deleted_at: Option<DateTime<Utc>>,
+) -> Option<MessagePreview> {
+    Some(MessagePreview {
+        id: id?,
+        sender_id: sender_id?,
+        body: body?,
+        is_deleted: deleted_at.is_some(),
+    })
 }
 
 fn dm_key(left: Uuid, right: Uuid) -> String {
@@ -1068,7 +1542,10 @@ fn normalize_username(value: Option<String>) -> Result<Option<String>, ApiError>
 fn map_profile_update_error(error: sqlx::Error) -> ApiError {
     match error {
         sqlx::Error::Database(db_error) if db_error.code().as_deref() == Some("23505") => {
-            ApiError::Status(StatusCode::CONFLICT, "username is already taken".to_string())
+            ApiError::Status(
+                StatusCode::CONFLICT,
+                "username is already taken".to_string(),
+            )
         }
         other => other.into(),
     }
@@ -1118,11 +1595,7 @@ fn normalize_platform(value: String) -> Result<String, ApiError> {
 
 fn non_empty_or_none(value: String) -> Option<String> {
     let value = value.trim().to_string();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn parse_receipt_status(value: &str) -> Option<ReceiptStatus> {
@@ -1166,8 +1639,9 @@ fn normalize_contact_phones(phones: Vec<String>) -> Result<Vec<String>, ApiError
 #[cfg(test)]
 mod tests {
     use super::{
-        ReceiptStatus, canonical_phone, dm_key, is_online, normalize_avatar_path, normalize_message_body,
-        normalize_platform, normalize_push_token, normalize_username, parse_receipt_status, phone_digits,
+        ReceiptStatus, canonical_phone, dm_key, is_online, normalize_avatar_path,
+        normalize_message_body, normalize_platform, normalize_push_token, normalize_username,
+        parse_receipt_status, phone_digits,
     };
     use chrono::{Duration, Utc};
     use uuid::{Uuid, uuid};
@@ -1207,7 +1681,10 @@ mod tests {
 
     #[test]
     fn validates_username_length() {
-        assert_eq!(normalize_username(Some("  Aa  ".to_string())).unwrap(), Some("aa".to_string()));
+        assert_eq!(
+            normalize_username(Some("  Aa  ".to_string())).unwrap(),
+            Some("aa".to_string())
+        );
         assert!(normalize_username(Some("x".to_string())).is_err());
     }
 
@@ -1223,9 +1700,18 @@ mod tests {
 
     #[test]
     fn parses_receipt_status_values() {
-        assert!(matches!(parse_receipt_status("sent"), Some(ReceiptStatus::Sent)));
-        assert!(matches!(parse_receipt_status("delivered"), Some(ReceiptStatus::Delivered)));
-        assert!(matches!(parse_receipt_status("seen"), Some(ReceiptStatus::Seen)));
+        assert!(matches!(
+            parse_receipt_status("sent"),
+            Some(ReceiptStatus::Sent)
+        ));
+        assert!(matches!(
+            parse_receipt_status("delivered"),
+            Some(ReceiptStatus::Delivered)
+        ));
+        assert!(matches!(
+            parse_receipt_status("seen"),
+            Some(ReceiptStatus::Seen)
+        ));
     }
 
     #[test]

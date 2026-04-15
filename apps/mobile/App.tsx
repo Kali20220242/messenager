@@ -6,6 +6,7 @@ import { useEffect, useMemo, useRef, useState, startTransition } from "react";
 import {
   ActivityIndicator,
   Alert,
+  type AlertButton,
   AppState,
   FlatList,
   Image,
@@ -20,16 +21,20 @@ import {
   View,
 } from "react-native";
 
-import { getAvatarUrl, pickAndUploadAvatar } from "./src/lib/avatar";
+import { pickAndUploadAvatar, removeAvatarFiles, resolveAvatarUrl } from "./src/lib/avatar";
 import {
   type ClearChatScope,
   type ChatMessage,
   type ChatSummary,
+  type DeleteMessageScope,
   type MeProfile,
+  type MessagePreview,
   type ReceiptStatus,
   type UserProfile,
   clearChatHistory,
+  deleteMessage as deleteMessageRequest,
   discoverContacts,
+  editMessage as editMessageRequest,
   fetchChats,
   fetchMe,
   fetchMessages,
@@ -38,6 +43,7 @@ import {
   searchUserByUsername,
   sendHeartbeat,
   sendMessage as sendMessageRequest,
+  updateChatPreferences,
   updateMyProfile,
   upsertPushToken,
 } from "./src/lib/api";
@@ -97,11 +103,17 @@ const displayName = (profile: Pick<UserProfile, "username" | "phone_e164"> | nul
 const profilePresence = (profile: Pick<UserProfile, "is_online" | "last_seen_at"> | null | undefined) =>
   profile?.is_online ? "Online" : formatLastSeen(profile?.last_seen_at ?? null);
 
-const sortChatsByActivity = (items: ChatSummary[]) =>
+const sortChatsForDisplay = (items: ChatSummary[]) =>
   [...items].sort((left, right) => {
-    const leftTime = left.activity_at;
-    const rightTime = right.activity_at;
-    return rightTime.localeCompare(leftTime);
+    if (left.is_archived !== right.is_archived) {
+      return left.is_archived ? 1 : -1;
+    }
+
+    if (left.is_pinned !== right.is_pinned) {
+      return left.is_pinned ? -1 : 1;
+    }
+
+    return right.activity_at.localeCompare(left.activity_at);
   });
 
 const mergeChatSummaries = (current: ChatSummary[], incoming: ChatSummary[]) => {
@@ -113,21 +125,20 @@ const mergeChatSummaries = (current: ChatSummary[], incoming: ChatSummary[]) => 
     }
   }
 
-  return sortChatsByActivity([...nextById.values()]);
+  return sortChatsForDisplay([...nextById.values()]);
 };
 
-const mergeDraftMessages = (current: DraftMessage[], incoming: ChatMessage[]) => {
-  const merged = new Map<string, DraftMessage>();
+const mergeServerMessages = (current: DraftMessage[], incoming: ChatMessage[]) => {
+  const pendingMessages = current.filter(
+    (message) => message.status === "pending" || message.status === "failed",
+  );
+  const incomingIds = new Set(incoming.map((message) => message.id));
+  const merged = [
+    ...incoming,
+    ...pendingMessages.filter((message) => !incomingIds.has(message.id)),
+  ];
 
-  for (const message of current) {
-    merged.set(message.id, message);
-  }
-
-  for (const message of incoming) {
-    merged.set(message.id, message);
-  }
-
-  return [...merged.values()].sort((left, right) => left.created_at.localeCompare(right.created_at));
+  return merged.sort((left, right) => left.created_at.localeCompare(right.created_at));
 };
 
 const receiptCopy = (status: ReceiptStatus | null | undefined) => {
@@ -143,6 +154,12 @@ const receiptCopy = (status: ReceiptStatus | null | undefined) => {
   }
 };
 
+const messageBodyCopy = (message: Pick<ChatMessage, "body" | "deleted_at">) =>
+  message.deleted_at ? "Message deleted" : message.body;
+
+const previewBodyCopy = (preview: MessagePreview | null | undefined) =>
+  preview?.is_deleted ? "Deleted message" : preview?.body ?? "";
+
 const nativePlatform = (): "ios" | "android" | "web" =>
   Platform.OS === "ios" ? "ios" : Platform.OS === "android" ? "android" : "web";
 
@@ -153,8 +170,31 @@ function Avatar({
   profile: Pick<UserProfile, "username" | "phone_e164" | "avatar_path"> | null | undefined;
   size?: number;
 }) {
-  const avatarUrl = getAvatarUrl(profile?.avatar_path);
+  const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
   const label = displayName(profile).slice(0, 1).toUpperCase();
+
+  useEffect(() => {
+    let isCancelled = false;
+
+    const loadAvatar = async () => {
+      try {
+        const nextUrl = await resolveAvatarUrl(profile?.avatar_path);
+        if (!isCancelled) {
+          setAvatarUrl(nextUrl);
+        }
+      } catch {
+        if (!isCancelled) {
+          setAvatarUrl(null);
+        }
+      }
+    };
+
+    void loadAvatar();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [profile?.avatar_path]);
 
   if (avatarUrl) {
     return (
@@ -229,6 +269,10 @@ export default function App() {
   const [chatCursor, setChatCursor] = useState<string | null>(null);
   const [hasMoreChats, setHasMoreChats] = useState(true);
   const [appStateStatus, setAppStateStatus] = useState(AppState.currentState);
+  const [replyingToMessage, setReplyingToMessage] = useState<ChatMessage | null>(null);
+  const [editingMessage, setEditingMessage] = useState<ChatMessage | null>(null);
+  const [forwardingMessage, setForwardingMessage] = useState<ChatMessage | null>(null);
+  const [isUpdatingChatPreferences, setIsUpdatingChatPreferences] = useState(false);
   const listRef = useRef<FlatList<DraftMessage>>(null);
   const realtimeChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
   const realtimeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -257,6 +301,7 @@ export default function App() {
       displayName(left).localeCompare(displayName(right)),
     );
   }, [contactResults, searchResults]);
+  const displayedChats = useMemo(() => sortChatsForDisplay(chats), [chats]);
 
   useEffect(() => {
     const initialize = async () => {
@@ -427,6 +472,9 @@ export default function App() {
       setHasMoreChats(true);
       setMessages([]);
       setMeProfile(null);
+      setReplyingToMessage(null);
+      setEditingMessage(null);
+      setForwardingMessage(null);
       startTransition(() => setCurrentScreen("phone-auth"));
       return;
     }
@@ -450,6 +498,9 @@ export default function App() {
         setOtpInput("");
         setSearchInput("");
         setDraft("");
+        setReplyingToMessage(null);
+        setEditingMessage(null);
+        setForwardingMessage(null);
         setAuthError("Session expired. Please sign in again.");
         return;
       }
@@ -512,7 +563,7 @@ export default function App() {
 
     try {
       const nextMessages = await fetchMessages(chatId);
-      setMessages((current) => mergeDraftMessages(current, nextMessages));
+      setMessages((current) => mergeServerMessages(current, nextMessages));
       setChats((current) =>
         current.map((chat) => (chat.id === chatId ? { ...chat, unread_count: 0 } : chat)),
       );
@@ -579,12 +630,12 @@ export default function App() {
             return [...current, message];
           });
           setChats((current) =>
-            sortChatsByActivity(
+            sortChatsForDisplay(
               current.map((chat) =>
                 chat.id === chatId
                   ? {
                       ...chat,
-                      last_message: message.body,
+                      last_message: messageBodyCopy(message),
                       last_message_at: message.created_at,
                       activity_at: message.created_at,
                       unread_count:
@@ -594,6 +645,20 @@ export default function App() {
               ),
             ),
           );
+          void loadChats({ silent: true });
+          resetRealtimeTimer();
+        },
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "messages",
+          filter: `chat_id=eq.${chatId}`,
+        },
+        () => {
+          void loadMessages(chatId, { silent: true });
           void loadChats({ silent: true });
           resetRealtimeTimer();
         },
@@ -752,7 +817,7 @@ export default function App() {
       const chat = await openDirectChat(peer.id);
       setChats((current) => {
         const withoutCurrent = current.filter((item) => item.id !== chat.id);
-        return sortChatsByActivity([chat, ...withoutCurrent]);
+        return sortChatsForDisplay([chat, ...withoutCurrent]);
       });
       selectChat(chat.id, chat.peer.phone_e164);
     } catch (error) {
@@ -769,6 +834,83 @@ export default function App() {
     selectChat(chat.id, chat.peer.phone_e164);
   };
 
+  const applyChatSummaryUpdate = (summary: ChatSummary) => {
+    setChats((current) => {
+      const next = current.filter((item) => item.id !== summary.id);
+      return sortChatsForDisplay([summary, ...next]);
+    });
+  };
+
+  const handleUpdateChatPreferences = async (payload: {
+    archived?: boolean;
+    pinned?: boolean;
+    muted?: boolean;
+  }) => {
+    if (!selectedChatId) {
+      return;
+    }
+
+    setIsUpdatingChatPreferences(true);
+    setChatError(null);
+
+    try {
+      const summary = await updateChatPreferences(selectedChatId, payload);
+      applyChatSummaryUpdate(summary);
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : "Failed to update chat preferences.");
+    } finally {
+      setIsUpdatingChatPreferences(false);
+    }
+  };
+
+  const handleChatOptions = () => {
+    if (!selectedChat) {
+      return;
+    }
+
+    const muteLabel = selectedChat.is_muted ? "Unmute chat" : "Mute chat";
+    const pinLabel = selectedChat.is_pinned ? "Unpin chat" : "Pin chat";
+    const archiveLabel = selectedChat.is_archived ? "Unarchive chat" : "Archive chat";
+
+    if (Platform.OS === "web") {
+      const promptOnWeb = (globalThis as { prompt?: (message: string) => string | null }).prompt;
+      const action = promptOnWeb?.(
+        "Choose action: pin, unpin, mute, unmute, archive, unarchive",
+      )?.trim().toLowerCase();
+
+      switch (action) {
+        case "pin":
+          void handleUpdateChatPreferences({ pinned: true });
+          break;
+        case "unpin":
+          void handleUpdateChatPreferences({ pinned: false });
+          break;
+        case "mute":
+          void handleUpdateChatPreferences({ muted: true });
+          break;
+        case "unmute":
+          void handleUpdateChatPreferences({ muted: false });
+          break;
+        case "archive":
+          void handleUpdateChatPreferences({ archived: true });
+          break;
+        case "unarchive":
+          void handleUpdateChatPreferences({ archived: false });
+          break;
+        default:
+          break;
+      }
+      return;
+    }
+
+    Alert.alert("Chat options", displayName(selectedChat.peer), [
+      { text: pinLabel, onPress: () => { void handleUpdateChatPreferences({ pinned: !selectedChat.is_pinned }); } },
+      { text: muteLabel, onPress: () => { void handleUpdateChatPreferences({ muted: !selectedChat.is_muted }); } },
+      { text: archiveLabel, onPress: () => { void handleUpdateChatPreferences({ archived: !selectedChat.is_archived }); } },
+      { style: "cancel", text: "Cancel" },
+    ]);
+  };
+
   const runClearHistory = async (scope: ClearChatScope) => {
     if (!selectedChatId) {
       return;
@@ -777,6 +919,8 @@ export default function App() {
     try {
       await clearChatHistory(selectedChatId, scope);
       setMessages([]);
+      setReplyingToMessage(null);
+      setEditingMessage(null);
       await loadChats({ reset: true, silent: true });
       if (selectedChatId) {
         await loadMessages(selectedChatId, { silent: true });
@@ -825,8 +969,128 @@ export default function App() {
     ]);
   };
 
+  const handleStartReply = (message: ChatMessage) => {
+    setReplyingToMessage(message);
+    setEditingMessage(null);
+  };
+
+  const handleStartEdit = (message: ChatMessage) => {
+    if (message.deleted_at) {
+      return;
+    }
+
+    setEditingMessage(message);
+    setReplyingToMessage(null);
+    setForwardingMessage(null);
+    setDraft(message.body);
+  };
+
+  const handleStartForward = (message: ChatMessage) => {
+    if (message.deleted_at) {
+      return;
+    }
+
+    setForwardingMessage(message);
+    setReplyingToMessage(null);
+    setEditingMessage(null);
+    setDraft("");
+    stopRealtime();
+    clearSelectedChat();
+    startTransition(() => setCurrentScreen("chat-list"));
+  };
+
+  const runDeleteMessage = async (message: ChatMessage, scope: DeleteMessageScope) => {
+    if (!selectedChatId) {
+      return;
+    }
+
+    try {
+      await deleteMessageRequest(selectedChatId, message.id, scope);
+      await loadMessages(selectedChatId, { silent: true });
+      await loadChats({ silent: true });
+      if (editingMessage?.id === message.id) {
+        setEditingMessage(null);
+        setDraft("");
+      }
+      if (replyingToMessage?.id === message.id) {
+        setReplyingToMessage(null);
+      }
+      setChatError(null);
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : "Failed to delete message.");
+    }
+  };
+
+  const handleMessageActions = (message: ChatMessage) => {
+    const isOwnMessage = message.sender_id === currentUserId;
+    const canEdit = isOwnMessage && !message.deleted_at;
+    const canDeleteForEveryone = isOwnMessage;
+
+    if (Platform.OS === "web") {
+      const promptOnWeb = (globalThis as { prompt?: (message: string) => string | null }).prompt;
+      const action = promptOnWeb?.(
+        "Choose action: reply, forward, edit, delete_me, delete_everyone",
+      )?.trim().toLowerCase();
+
+      switch (action) {
+        case "reply":
+          handleStartReply(message);
+          break;
+        case "forward":
+          handleStartForward(message);
+          break;
+        case "edit":
+          if (canEdit) {
+            handleStartEdit(message);
+          }
+          break;
+        case "delete_me":
+          void runDeleteMessage(message, "self_only");
+          break;
+        case "delete_everyone":
+          if (canDeleteForEveryone) {
+            void runDeleteMessage(message, "everyone");
+          }
+          break;
+        default:
+          break;
+      }
+      return;
+    }
+
+    const actions: AlertButton[] = [
+      { text: "Reply", onPress: () => handleStartReply(message) },
+      { text: "Forward", onPress: () => handleStartForward(message) },
+    ];
+
+    if (canEdit) {
+      actions.push({ text: "Edit", onPress: () => handleStartEdit(message) });
+    }
+
+    actions.push({
+      text: "Delete for me",
+      onPress: () => {
+        void runDeleteMessage(message, "self_only");
+      },
+      style: "destructive" as const,
+    });
+
+    if (canDeleteForEveryone) {
+      actions.push({
+        text: "Delete for everyone",
+        onPress: () => {
+          void runDeleteMessage(message, "everyone");
+        },
+        style: "destructive" as const,
+      });
+    }
+
+    actions.push({ text: "Cancel", style: "cancel" as const });
+    Alert.alert("Message actions", undefined, actions);
+  };
+
   const handleSendMessage = async () => {
-    const body = draft.trim();
+    const body = forwardingMessage ? forwardingMessage.body.trim() : draft.trim();
 
     if (!selectedChatId || !body) {
       return;
@@ -844,50 +1108,89 @@ export default function App() {
       body,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
+      edited_at: null,
+      deleted_at: null,
       receipt_status: "sent",
+      reply_to: replyingToMessage
+        ? {
+            id: replyingToMessage.id,
+            sender_id: replyingToMessage.sender_id,
+            body: previewBodyCopy(replyingToMessage.reply_to) || messageBodyCopy(replyingToMessage),
+            is_deleted: Boolean(replyingToMessage.deleted_at),
+          }
+        : null,
+      forwarded_from: forwardingMessage
+        ? {
+            id: forwardingMessage.id,
+            sender_id: forwardingMessage.sender_id,
+            body: messageBodyCopy(forwardingMessage),
+            is_deleted: Boolean(forwardingMessage.deleted_at),
+          }
+        : null,
       status: "pending",
     };
 
     setDraft("");
-    setMessages((current) => [...current, optimisticMessage]);
+    if (!editingMessage) {
+      setMessages((current) => [...current, optimisticMessage]);
+    }
 
     try {
-      const saved = await sendMessageRequest(selectedChatId, body);
-      setMessages((current) => {
-        const next = current.map((message) => (message.id === tempId ? saved : message));
-        return next.filter(
-          (message, index, collection) =>
-            collection.findIndex((candidate) => candidate.id === message.id) === index,
+      if (editingMessage) {
+        const saved = await editMessageRequest(selectedChatId, editingMessage.id, body);
+        setMessages((current) =>
+          current.map((message) => (message.id === editingMessage.id ? { ...message, ...saved } : message)),
         );
-      });
+        setEditingMessage(null);
+      } else {
+        const saved = await sendMessageRequest(selectedChatId, {
+          body,
+          reply_to_message_id: replyingToMessage?.id ?? null,
+          forwarded_from_message_id: forwardingMessage?.id ?? null,
+        });
+        setMessages((current) => {
+          const next = current.map((message) => (message.id === tempId ? saved : message));
+          return next.filter(
+            (message, index, collection) =>
+              collection.findIndex((candidate) => candidate.id === message.id) === index,
+          );
+        });
+      }
       setChats((current) =>
-        sortChatsByActivity(
+        sortChatsForDisplay(
           current.map((chat) =>
             chat.id === selectedChatId
               ? {
                   ...chat,
-                  last_message: saved.body,
-                  last_message_at: saved.created_at,
-                  activity_at: saved.created_at,
+                  last_message: body,
+                  last_message_at: new Date().toISOString(),
+                  activity_at: new Date().toISOString(),
                 }
               : chat,
           ),
         ),
       );
+      setReplyingToMessage(null);
+      setForwardingMessage(null);
       void loadChats({ silent: true });
+      void loadMessages(selectedChatId, { silent: true });
       resetRealtimeTimer();
     } catch (error) {
-      setMessages((current) =>
-        current.map((message) =>
-          message.id === tempId
-            ? {
-                ...message,
-                status: "failed",
-                error: error instanceof Error ? error.message : "Failed to send message.",
-              }
-            : message,
-        ),
-      );
+      if (editingMessage) {
+        setDraft(body);
+      } else {
+        setMessages((current) =>
+          current.map((message) =>
+            message.id === tempId
+              ? {
+                  ...message,
+                  status: "failed",
+                  error: error instanceof Error ? error.message : "Failed to send message.",
+                }
+              : message,
+          ),
+        );
+      }
       setChatError(error instanceof Error ? error.message : "Failed to send message.");
     } finally {
       setIsSendingMessage(false);
@@ -922,16 +1225,26 @@ export default function App() {
     setProfileError(null);
 
     try {
+      const previousAvatarPath = meProfile?.avatar_path ?? null;
       const avatarPath = await pickAndUploadAvatar(currentUserId);
       if (!avatarPath) {
         return;
       }
 
-      const nextProfile = await updateMyProfile({
-        username: profileUsernameInput.trim() || null,
-        avatar_path: avatarPath,
-      });
-      setMeProfile(nextProfile);
+      try {
+        const nextProfile = await updateMyProfile({
+          username: profileUsernameInput.trim() || null,
+          avatar_path: avatarPath,
+        });
+        setMeProfile(nextProfile);
+
+        if (previousAvatarPath && previousAvatarPath !== avatarPath) {
+          await removeAvatarFiles([previousAvatarPath]);
+        }
+      } catch (error) {
+        await removeAvatarFiles([avatarPath]).catch(() => {});
+        throw error;
+      }
     } catch (error) {
       setProfileError(error instanceof Error ? error.message : "Failed to upload avatar.");
     } finally {
@@ -944,11 +1257,13 @@ export default function App() {
     setProfileError(null);
 
     try {
+      const previousAvatarPath = meProfile?.avatar_path ?? null;
       const nextProfile = await updateMyProfile({
         username: profileUsernameInput.trim() || null,
         avatar_path: null,
       });
       setMeProfile(nextProfile);
+      await removeAvatarFiles([previousAvatarPath]);
     } catch (error) {
       setProfileError(error instanceof Error ? error.message : "Failed to remove avatar.");
     } finally {
@@ -976,6 +1291,9 @@ export default function App() {
     setDraft("");
     setContactResults([]);
     setSearchResults([]);
+    setReplyingToMessage(null);
+    setEditingMessage(null);
+    setForwardingMessage(null);
   };
 
   const renderPhoneAuth = () => (
@@ -1081,12 +1399,20 @@ export default function App() {
 
       {authError ? <Text style={styles.errorText}>{authError}</Text> : null}
       {chatError ? <Text style={styles.errorText}>{chatError}</Text> : null}
+      {forwardingMessage ? (
+        <View style={styles.bannerCard}>
+          <Text style={styles.bannerTitle}>Forwarding message</Text>
+          <Text style={styles.bannerSubtitle} numberOfLines={2}>
+            {messageBodyCopy(forwardingMessage)}
+          </Text>
+        </View>
+      ) : null}
 
       {isLoadingChats ? (
         <ActivityIndicator color="#17305e" style={styles.loader} />
       ) : (
         <FlatList
-          data={chats}
+          data={displayedChats}
           keyExtractor={(item) => item.id}
           contentContainerStyle={styles.listContent}
           onEndReached={() => {
@@ -1110,6 +1436,11 @@ export default function App() {
                   {item.peer.is_online ? <View style={styles.onlineDot} /> : null}
                 </View>
                 <Text style={styles.chatSubline}>{item.peer.phone_e164}</Text>
+                <View style={styles.chatFlagsRow}>
+                  {item.is_pinned ? <Text style={styles.chatFlag}>Pinned</Text> : null}
+                  {item.is_muted ? <Text style={styles.chatFlag}>Muted</Text> : null}
+                  {item.is_archived ? <Text style={styles.chatFlag}>Archived</Text> : null}
+                </View>
                 <Text style={styles.chatPreview} numberOfLines={1}>
                   {item.last_message ?? "No messages yet"}
                 </Text>
@@ -1224,6 +1555,15 @@ export default function App() {
       </View>
 
       <View style={styles.profileCard}>
+        {forwardingMessage ? (
+          <View style={styles.bannerCard}>
+            <Text style={styles.bannerTitle}>Forwarding message</Text>
+            <Text style={styles.bannerSubtitle} numberOfLines={2}>
+              Choose a chat or create a new one, then send.
+            </Text>
+          </View>
+        ) : null}
+
         <Text style={styles.label}>Username</Text>
         <TextInput
           style={styles.input}
@@ -1302,6 +1642,15 @@ export default function App() {
         <View style={styles.topBarActions}>
           <Pressable
             style={styles.secondaryButton}
+            onPress={handleChatOptions}
+            disabled={isUpdatingChatPreferences}
+          >
+            <Text style={styles.secondaryButtonText}>
+              {isUpdatingChatPreferences ? "Saving..." : "Manage"}
+            </Text>
+          </Pressable>
+          <Pressable
+            style={styles.secondaryButton}
             onPress={handleClearHistory}
           >
             <Text style={styles.secondaryButtonText}>Clear history</Text>
@@ -1312,6 +1661,8 @@ export default function App() {
               stopRealtime();
               clearSelectedChat();
               setMessages([]);
+              setReplyingToMessage(null);
+              setEditingMessage(null);
               startTransition(() => setCurrentScreen("chat-list"));
             }}
           >
@@ -1321,6 +1672,52 @@ export default function App() {
       </View>
 
       {chatError ? <Text style={styles.errorText}>{chatError}</Text> : null}
+      {selectedChat ? (
+        <View style={styles.chatFlagsRow}>
+          {selectedChat.is_pinned ? <Text style={styles.chatFlag}>Pinned</Text> : null}
+          {selectedChat.is_muted ? <Text style={styles.chatFlag}>Muted</Text> : null}
+          {selectedChat.is_archived ? <Text style={styles.chatFlag}>Archived</Text> : null}
+        </View>
+      ) : null}
+      {replyingToMessage ? (
+        <View style={styles.bannerCard}>
+          <Text style={styles.bannerTitle}>Replying</Text>
+          <Text style={styles.bannerSubtitle} numberOfLines={2}>
+            {messageBodyCopy(replyingToMessage)}
+          </Text>
+          <Pressable style={styles.linkButton} onPress={() => setReplyingToMessage(null)}>
+            <Text style={styles.linkButtonText}>Cancel reply</Text>
+          </Pressable>
+        </View>
+      ) : null}
+      {editingMessage ? (
+        <View style={styles.bannerCard}>
+          <Text style={styles.bannerTitle}>Editing message</Text>
+          <Text style={styles.bannerSubtitle} numberOfLines={2}>
+            {messageBodyCopy(editingMessage)}
+          </Text>
+          <Pressable
+            style={styles.linkButton}
+            onPress={() => {
+              setEditingMessage(null);
+              setDraft("");
+            }}
+          >
+            <Text style={styles.linkButtonText}>Cancel edit</Text>
+          </Pressable>
+        </View>
+      ) : null}
+      {forwardingMessage ? (
+        <View style={styles.bannerCard}>
+          <Text style={styles.bannerTitle}>Forwarding message</Text>
+          <Text style={styles.bannerSubtitle} numberOfLines={2}>
+            {messageBodyCopy(forwardingMessage)}
+          </Text>
+          <Pressable style={styles.linkButton} onPress={() => setForwardingMessage(null)}>
+            <Text style={styles.linkButtonText}>Cancel forward</Text>
+          </Pressable>
+        </View>
+      ) : null}
 
       {isLoadingMessages ? (
         <ActivityIndicator color="#17305e" style={styles.loader} />
@@ -1334,14 +1731,72 @@ export default function App() {
             const isOwn = item.sender_id === currentUserId;
             return (
               <View style={[styles.messageRow, isOwn ? styles.messageRowOwn : styles.messageRowPeer]}>
-                <View style={[styles.messageBubble, isOwn ? styles.ownBubble : styles.peerBubble]}>
-                  <Text style={[styles.messageBody, isOwn && styles.ownMessageBody]}>{item.body}</Text>
+                <Pressable
+                  style={[styles.messageBubble, isOwn ? styles.ownBubble : styles.peerBubble]}
+                  onLongPress={() => handleMessageActions(item)}
+                >
+                  {item.reply_to ? (
+                    <View
+                      style={[
+                        styles.messageContextCard,
+                        !isOwn && styles.messageContextCardPeer,
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.messageContextLabel,
+                          !isOwn && styles.messageContextLabelPeer,
+                        ]}
+                      >
+                        Reply
+                      </Text>
+                      <Text
+                        style={[
+                          styles.messageContextBody,
+                          !isOwn && styles.messageContextBodyPeer,
+                        ]}
+                        numberOfLines={2}
+                      >
+                        {previewBodyCopy(item.reply_to)}
+                      </Text>
+                    </View>
+                  ) : null}
+                  {item.forwarded_from ? (
+                    <View
+                      style={[
+                        styles.messageContextCard,
+                        !isOwn && styles.messageContextCardPeer,
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.messageContextLabel,
+                          !isOwn && styles.messageContextLabelPeer,
+                        ]}
+                      >
+                        Forwarded
+                      </Text>
+                      <Text
+                        style={[
+                          styles.messageContextBody,
+                          !isOwn && styles.messageContextBodyPeer,
+                        ]}
+                        numberOfLines={2}
+                      >
+                        {previewBodyCopy(item.forwarded_from)}
+                      </Text>
+                    </View>
+                  ) : null}
+                  <Text style={[styles.messageBody, isOwn && styles.ownMessageBody]}>
+                    {messageBodyCopy(item)}
+                  </Text>
                   <Text style={[styles.messageMeta, isOwn && styles.ownMessageMeta]}>
                     {formatTime(item.created_at)}
+                    {item.edited_at ? " · Edited" : ""}
                     {item.status === "pending" ? " · Sending" : ""}
                     {item.status === "failed" ? " · Failed" : ""}
                   </Text>
-                  {isOwn && !item.status ? (
+                  {isOwn && !item.status && !item.deleted_at ? (
                     <Text style={[styles.messageMeta, styles.statusCopy, styles.ownMessageMeta]}>
                       {receiptCopy(item.receipt_status)}
                     </Text>
@@ -1349,7 +1804,7 @@ export default function App() {
                   {item.error ? (
                     <Text style={[styles.messageMeta, styles.failedMessageText]}>{item.error}</Text>
                   ) : null}
-                </View>
+                </Pressable>
               </View>
             );
           }}
@@ -1362,7 +1817,16 @@ export default function App() {
           style={styles.composerInput}
           value={draft}
           onChangeText={setDraft}
-          placeholder="Message"
+          editable={!forwardingMessage || Boolean(editingMessage)}
+          placeholder={
+            editingMessage
+              ? "Edit message"
+              : forwardingMessage
+                ? "Forward message"
+                : replyingToMessage
+                  ? "Reply"
+                  : "Message"
+          }
           placeholderTextColor="#8a8f9f"
           multiline
           onFocus={ensureRealtime}
@@ -1370,7 +1834,7 @@ export default function App() {
         <Pressable
           style={styles.primaryButton}
           onPress={handleSendMessage}
-          disabled={isSendingMessage || draft.trim().length === 0}
+          disabled={isSendingMessage || (draft.trim().length === 0 && !forwardingMessage)}
         >
           <Text style={styles.primaryButtonText}>{isSendingMessage ? "Sending..." : "Send"}</Text>
         </Pressable>
@@ -1563,6 +2027,22 @@ const styles = StyleSheet.create({
     color: "#637089",
     fontSize: 12,
   },
+  chatFlagsRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+    marginTop: 4,
+  },
+  chatFlag: {
+    backgroundColor: "#ece6da",
+    borderRadius: 999,
+    color: "#6f614d",
+    fontSize: 11,
+    fontWeight: "700",
+    overflow: "hidden",
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+  },
   chatPreview: {
     color: "#647188",
     fontSize: 13,
@@ -1613,6 +2093,24 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     gap: 14,
     padding: 18,
+  },
+  bannerCard: {
+    backgroundColor: "#f5efe3",
+    borderColor: "#ddd5c8",
+    borderRadius: 18,
+    borderWidth: 1,
+    gap: 6,
+    padding: 14,
+  },
+  bannerTitle: {
+    color: "#18243d",
+    fontSize: 13,
+    fontWeight: "800",
+  },
+  bannerSubtitle: {
+    color: "#5b667a",
+    fontSize: 13,
+    lineHeight: 18,
   },
   profileHero: {
     alignItems: "center",
@@ -1699,6 +2197,33 @@ const styles = StyleSheet.create({
     maxWidth: "84%",
     paddingHorizontal: 14,
     paddingVertical: 12,
+  },
+  messageContextCard: {
+    backgroundColor: "rgba(255, 253, 248, 0.16)",
+    borderRadius: 12,
+    marginBottom: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  messageContextCardPeer: {
+    backgroundColor: "#f4eee3",
+  },
+  messageContextLabel: {
+    color: "#cbd6ed",
+    fontSize: 11,
+    fontWeight: "800",
+    marginBottom: 4,
+  },
+  messageContextLabelPeer: {
+    color: "#6f614d",
+  },
+  messageContextBody: {
+    color: "#fffdf8",
+    fontSize: 12,
+    lineHeight: 16,
+  },
+  messageContextBodyPeer: {
+    color: "#43506a",
   },
   ownBubble: {
     backgroundColor: "#183055",

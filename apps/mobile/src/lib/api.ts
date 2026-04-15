@@ -21,6 +21,16 @@ export type ChatSummary = {
   last_message_at: string | null;
   activity_at: string;
   unread_count: number;
+  is_archived: boolean;
+  is_pinned: boolean;
+  is_muted: boolean;
+};
+
+export type MessagePreview = {
+  id: string;
+  sender_id: string;
+  body: string;
+  is_deleted: boolean;
 };
 
 export type ChatMessage = {
@@ -30,11 +40,16 @@ export type ChatMessage = {
   body: string;
   created_at: string;
   updated_at: string;
+  edited_at?: string | null;
+  deleted_at?: string | null;
   receipt_status?: ReceiptStatus | null;
+  reply_to?: MessagePreview | null;
+  forwarded_from?: MessagePreview | null;
 };
 
 type ApiMethod = "GET" | "POST" | "PATCH" | "DELETE";
 export type ClearChatScope = "self_only" | "everyone";
+export type DeleteMessageScope = "self_only" | "everyone";
 
 type ApiRequestInit = {
   method?: ApiMethod;
@@ -204,6 +219,16 @@ export function clearChatHistory(chatId: string, scope: ClearChatScope) {
   });
 }
 
+export function updateChatPreferences(
+  chatId: string,
+  payload: { archived?: boolean; pinned?: boolean; muted?: boolean },
+) {
+  return apiRequest<ChatSummary>(`/chats/${chatId}/preferences`, {
+    method: "PATCH",
+    body: payload,
+  });
+}
+
 export function fetchMessages(chatId: string, before?: string, limit = 50) {
   return apiRequest<ChatMessage[]>(`/chats/${chatId}/messages`, {
     query: {
@@ -213,9 +238,30 @@ export function fetchMessages(chatId: string, before?: string, limit = 50) {
   });
 }
 
-export function sendMessage(chatId: string, body: string) {
+export function sendMessage(
+  chatId: string,
+  payload: {
+    body: string;
+    reply_to_message_id?: string | null;
+    forwarded_from_message_id?: string | null;
+  },
+) {
   return apiRequest<ChatMessage>(`/chats/${chatId}/messages`, {
     method: "POST",
+    body: payload,
+  });
+}
+
+export function editMessage(chatId: string, messageId: string, body: string) {
+  return apiRequest<ChatMessage>(`/chats/${chatId}/messages/${messageId}`, {
+    method: "PATCH",
     body: { body },
+  });
+}
+
+export function deleteMessage(chatId: string, messageId: string, scope: DeleteMessageScope) {
+  return apiRequest<void>(`/chats/${chatId}/messages/${messageId}/delete`, {
+    method: "POST",
+    body: { scope },
   });
 }
