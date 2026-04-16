@@ -1,5 +1,5 @@
 import { env } from "./env";
-import { supabase } from "./supabase";
+import { supabase } from "../supabase";
 
 export type ReceiptStatus = "sent" | "delivered" | "seen";
 
@@ -45,6 +45,70 @@ export type ChatMessage = {
   receipt_status?: ReceiptStatus | null;
   reply_to?: MessagePreview | null;
   forwarded_from?: MessagePreview | null;
+};
+
+export type E2EESignedPreKeyUpload = {
+  key_id: number;
+  public_key: string;
+  signature: string;
+};
+
+export type E2EEOneTimePreKeyUpload = {
+  key_id: number;
+  public_key: string;
+};
+
+export type E2EEDeviceKeysUpload = {
+  device_id: string;
+  registration_id: number;
+  identity_key: string;
+  signed_prekey: E2EESignedPreKeyUpload;
+  one_time_prekeys: E2EEOneTimePreKeyUpload[];
+};
+
+export type E2EEDeviceKeysResponse = {
+  device_id: string;
+  registration_id: number;
+  uploaded_one_time_prekeys: number;
+};
+
+export type E2EESignedPreKeyBundle = {
+  key_id: number;
+  public_key: string;
+  signature: string;
+};
+
+export type E2EEOneTimePreKeyBundle = {
+  key_id: number;
+  public_key: string;
+};
+
+export type E2EEDeviceBundle = {
+  device_id: string;
+  registration_id: number;
+  identity_key: string;
+  signed_prekey: E2EESignedPreKeyBundle;
+  one_time_prekey?: E2EEOneTimePreKeyBundle | null;
+};
+
+export type E2EEPendingMessage = {
+  id: string;
+  sender_user_id: string;
+  sender_device_id: string;
+  receiver_device_id: string;
+  message_type: number;
+  ciphertext: string;
+  client_message_id?: string | null;
+  created_at: string;
+  delivered_at?: string | null;
+};
+
+export type E2EEPendingMessageEnvelope = {
+  sender_device_id: string;
+  receiver_device_id: string;
+  message_type: number;
+  ciphertext: string;
+  client_message_id?: string | null;
 };
 
 type ApiMethod = "GET" | "POST" | "PATCH" | "DELETE";
@@ -256,6 +320,34 @@ export function editMessage(chatId: string, messageId: string, body: string) {
   return apiRequest<ChatMessage>(`/chats/${chatId}/messages/${messageId}`, {
     method: "PATCH",
     body: { body },
+  });
+}
+
+export function uploadE2EEDeviceKeys(payload: E2EEDeviceKeysUpload) {
+  return apiRequest<E2EEDeviceKeysResponse>("/e2ee/devices/keys", {
+    method: "POST",
+    body: payload,
+  });
+}
+
+export function fetchE2EEDeviceBundles(userId: string) {
+  return apiRequest<E2EEDeviceBundle[]>(`/e2ee/users/${userId}/device-bundles`);
+}
+
+export function sendE2EEPendingMessage(payload: E2EEPendingMessageEnvelope) {
+  return apiRequest<E2EEPendingMessage>("/e2ee/messages", {
+    method: "POST",
+    body: payload,
+  });
+}
+
+export function fetchE2EEPendingMessages(deviceId: string) {
+  return apiRequest<E2EEPendingMessage[]>(`/e2ee/devices/${deviceId}/pending-messages`);
+}
+
+export function ackE2EEPendingMessage(deviceId: string, pendingMessageId: string) {
+  return apiRequest<void>(`/e2ee/devices/${deviceId}/pending-messages/${pendingMessageId}/ack`, {
+    method: "POST",
   });
 }
 

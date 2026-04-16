@@ -189,6 +189,108 @@ struct PushTokenRequest {
 }
 
 #[derive(Deserialize)]
+struct UpsertDeviceKeysRequest {
+    device_id: Uuid,
+    registration_id: i32,
+    identity_key: String,
+    signed_prekey: SignedPreKeyUpload,
+    one_time_prekeys: Vec<OneTimePreKeyUpload>,
+}
+
+#[derive(Deserialize)]
+struct SignedPreKeyUpload {
+    key_id: i32,
+    public_key: String,
+    signature: String,
+}
+
+#[derive(Clone, Deserialize)]
+struct OneTimePreKeyUpload {
+    key_id: i32,
+    public_key: String,
+}
+
+#[derive(Serialize)]
+struct DeviceKeysResponse {
+    device_id: Uuid,
+    registration_id: i32,
+    uploaded_one_time_prekeys: usize,
+}
+
+#[derive(Serialize, FromRow)]
+struct DeviceBundleRow {
+    device_id: Uuid,
+    registration_id: i32,
+    identity_key: String,
+    signed_prekey_id: i32,
+    signed_prekey_public: String,
+    signed_prekey_signature: String,
+}
+
+#[derive(Clone, Serialize, FromRow)]
+struct ClaimedOneTimePreKey {
+    key_id: i32,
+    public_key: String,
+}
+
+#[derive(Serialize)]
+struct DeviceBundleResponse {
+    device_id: Uuid,
+    registration_id: i32,
+    identity_key: String,
+    signed_prekey: SignedPreKeyResponse,
+    one_time_prekey: Option<OneTimePreKeyResponse>,
+}
+
+#[derive(Serialize)]
+struct SignedPreKeyResponse {
+    key_id: i32,
+    public_key: String,
+    signature: String,
+}
+
+#[derive(Clone, Serialize)]
+struct OneTimePreKeyResponse {
+    key_id: i32,
+    public_key: String,
+}
+
+#[derive(Deserialize)]
+struct EnqueuePendingMessageRequest {
+    sender_device_id: Uuid,
+    receiver_device_id: Uuid,
+    message_type: i16,
+    ciphertext: String,
+    client_message_id: Option<Uuid>,
+}
+
+#[derive(Serialize, FromRow)]
+struct PendingMessageRow {
+    id: Uuid,
+    sender_user_id: Uuid,
+    sender_device_id: Uuid,
+    receiver_device_id: Uuid,
+    message_type: i16,
+    ciphertext: String,
+    client_message_id: Option<Uuid>,
+    created_at: DateTime<Utc>,
+    delivered_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Serialize)]
+struct PendingMessageResponse {
+    id: Uuid,
+    sender_user_id: Uuid,
+    sender_device_id: Uuid,
+    receiver_device_id: Uuid,
+    message_type: i16,
+    ciphertext: String,
+    client_message_id: Option<Uuid>,
+    created_at: DateTime<Utc>,
+    delivered_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Deserialize)]
 struct UpdateMessageRequest {
     body: String,
 }
@@ -230,6 +332,20 @@ pub fn router(state: AppState) -> Router {
         .route("/presence/heartbeat", post(heartbeat))
         .route("/devices/push-token", post(upsert_push_token))
         .route("/devices/push-token/remove", post(remove_push_token))
+        .route("/e2ee/devices/keys", post(upsert_device_keys))
+        .route(
+            "/e2ee/users/{user_id}/device-bundles",
+            get(list_device_bundles),
+        )
+        .route("/e2ee/messages", post(enqueue_pending_message))
+        .route(
+            "/e2ee/devices/{device_id}/pending-messages",
+            get(list_pending_messages),
+        )
+        .route(
+            "/e2ee/devices/{device_id}/pending-messages/{pending_message_id}/ack",
+            post(ack_pending_message),
+        )
         .route(
             "/users/search",
             get(search_user).route_layer(middleware::from_fn_with_state(
@@ -396,6 +512,285 @@ async fn remove_push_token(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn upsert_device_keys(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(payload): Json<UpsertDeviceKeysRequest>,
+) -> Result<Json<DeviceKeysResponse>, ApiError> {
+    let identity_key = normalize_key_material(payload.identity_key, "identity_key")?;
+    let signed_prekey_public =
+        normalize_key_material(payload.signed_prekey.public_key, "signed_prekey.public_key")?;
+    let signed_prekey_signature =
+        normalize_key_material(payload.signed_prekey.signature, "signed_prekey.signature")?;
+    let one_time_prekeys = normalize_one_time_prekeys(payload.one_time_prekeys)?;
+
+    if let Some(existing_owner) = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        select user_id
+        from public.e2ee_devices
+        where id = $1
+        "#,
+    )
+    .bind(payload.device_id)
+    .fetch_optional(&state.db)
+    .await?
+        && existing_owner != user.id
+    {
+        return Err(ApiError::Status(
+            StatusCode::CONFLICT,
+            "device_id is already registered to another user".to_string(),
+        ));
+    }
+
+    let mut tx = state.db.begin().await?;
+
+    sqlx::query(
+        r#"
+        insert into public.e2ee_devices (
+            id,
+            user_id,
+            registration_id,
+            identity_key,
+            signed_prekey_id,
+            signed_prekey_public,
+            signed_prekey_signature
+        )
+        values ($1, $2, $3, $4, $5, $6, $7)
+        on conflict (id) do update
+        set registration_id = excluded.registration_id,
+            identity_key = excluded.identity_key,
+            signed_prekey_id = excluded.signed_prekey_id,
+            signed_prekey_public = excluded.signed_prekey_public,
+            signed_prekey_signature = excluded.signed_prekey_signature,
+            updated_at = timezone('utc', now())
+        "#,
+    )
+    .bind(payload.device_id)
+    .bind(user.id)
+    .bind(payload.registration_id)
+    .bind(identity_key)
+    .bind(payload.signed_prekey.key_id)
+    .bind(signed_prekey_public)
+    .bind(signed_prekey_signature)
+    .execute(tx.as_mut())
+    .await?;
+
+    sqlx::query(
+        r#"
+        delete from public.e2ee_one_time_prekeys
+        where device_id = $1
+        "#,
+    )
+    .bind(payload.device_id)
+    .execute(tx.as_mut())
+    .await?;
+
+    for prekey in &one_time_prekeys {
+        sqlx::query(
+            r#"
+            insert into public.e2ee_one_time_prekeys (
+                device_id,
+                key_id,
+                public_key
+            )
+            values ($1, $2, $3)
+            "#,
+        )
+        .bind(payload.device_id)
+        .bind(prekey.key_id)
+        .bind(&prekey.public_key)
+        .execute(tx.as_mut())
+        .await?;
+    }
+
+    tx.commit().await?;
+
+    Ok(Json(DeviceKeysResponse {
+        device_id: payload.device_id,
+        registration_id: payload.registration_id,
+        uploaded_one_time_prekeys: one_time_prekeys.len(),
+    }))
+}
+
+async fn list_device_bundles(
+    State(state): State<AppState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(user_id): Path<Uuid>,
+) -> Result<Json<Vec<DeviceBundleResponse>>, ApiError> {
+    profile_by_id(&state.db, user_id).await?;
+
+    let mut tx = state.db.begin().await?;
+    let device_rows = sqlx::query_as::<_, DeviceBundleRow>(
+        r#"
+        select
+            id as device_id,
+            registration_id,
+            identity_key,
+            signed_prekey_id,
+            signed_prekey_public,
+            signed_prekey_signature
+        from public.e2ee_devices
+        where user_id = $1
+        order by created_at asc, id asc
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(tx.as_mut())
+    .await?;
+
+    if device_rows.is_empty() {
+        return Err(ApiError::NotFound(
+            "target user has no registered device keys".to_string(),
+        ));
+    }
+
+    let mut bundles = Vec::with_capacity(device_rows.len());
+    for row in device_rows {
+        let one_time_prekey =
+            consume_one_time_prekey(&mut tx, row.device_id)
+                .await?
+                .map(|prekey| OneTimePreKeyResponse {
+                    key_id: prekey.key_id,
+                    public_key: prekey.public_key,
+                });
+
+        bundles.push(DeviceBundleResponse {
+            device_id: row.device_id,
+            registration_id: row.registration_id,
+            identity_key: row.identity_key,
+            signed_prekey: SignedPreKeyResponse {
+                key_id: row.signed_prekey_id,
+                public_key: row.signed_prekey_public,
+                signature: row.signed_prekey_signature,
+            },
+            one_time_prekey,
+        });
+    }
+
+    tx.commit().await?;
+
+    Ok(Json(bundles))
+}
+
+async fn enqueue_pending_message(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(payload): Json<EnqueuePendingMessageRequest>,
+) -> Result<(StatusCode, Json<PendingMessageResponse>), ApiError> {
+    ensure_device_ownership(&state.db, payload.sender_device_id, user.id).await?;
+    ensure_device_exists(&state.db, payload.receiver_device_id).await?;
+
+    let ciphertext = normalize_key_material(payload.ciphertext, "ciphertext")?;
+    let message_type = normalize_message_type(payload.message_type)?;
+
+    let row = sqlx::query_as::<_, PendingMessageRow>(
+        r#"
+        insert into public.e2ee_pending_messages (
+            receiver_device_id,
+            sender_user_id,
+            sender_device_id,
+            message_type,
+            ciphertext,
+            client_message_id
+        )
+        values ($1, $2, $3, $4, $5, $6)
+        returning
+            id,
+            sender_user_id,
+            sender_device_id,
+            receiver_device_id,
+            message_type,
+            ciphertext,
+            client_message_id,
+            created_at,
+            delivered_at
+        "#,
+    )
+    .bind(payload.receiver_device_id)
+    .bind(user.id)
+    .bind(payload.sender_device_id)
+    .bind(message_type)
+    .bind(ciphertext)
+    .bind(payload.client_message_id)
+    .fetch_one(&state.db)
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(to_pending_message_response(row))))
+}
+
+async fn list_pending_messages(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(device_id): Path<Uuid>,
+) -> Result<Json<Vec<PendingMessageResponse>>, ApiError> {
+    ensure_device_ownership(&state.db, device_id, user.id).await?;
+
+    let rows = sqlx::query_as::<_, PendingMessageRow>(
+        r#"
+        with updated as (
+            update public.e2ee_pending_messages
+            set delivered_at = coalesce(delivered_at, timezone('utc', now()))
+            where receiver_device_id = $1
+              and acked_at is null
+            returning
+                id,
+                sender_user_id,
+                sender_device_id,
+                receiver_device_id,
+                message_type,
+                ciphertext,
+                client_message_id,
+                created_at,
+                delivered_at
+        )
+        select *
+        from updated
+        order by created_at asc, id asc
+        "#,
+    )
+    .bind(device_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(Json(
+        rows.into_iter().map(to_pending_message_response).collect(),
+    ))
+}
+
+async fn ack_pending_message(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((device_id, pending_message_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    ensure_device_ownership(&state.db, device_id, user.id).await?;
+
+    let deleted = sqlx::query(
+        r#"
+        with acked as (
+            update public.e2ee_pending_messages
+            set acked_at = timezone('utc', now())
+            where id = $1
+              and receiver_device_id = $2
+              and acked_at is null
+            returning id
+        )
+        delete from public.e2ee_pending_messages
+        where id in (select id from acked)
+        "#,
+    )
+    .bind(pending_message_id)
+    .bind(device_id)
+    .execute(&state.db)
+    .await?
+    .rows_affected();
+
+    if deleted == 0 {
+        return Err(ApiError::NotFound("pending message not found".to_string()));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn search_user(
     State(state): State<AppState>,
     Extension(user): Extension<CurrentUser>,
@@ -557,7 +952,6 @@ async fn delete_chat(
     ensure_chat_membership(&state.db, chat_id, user.id).await?;
 
     let mut tx = state.db.begin().await?;
-
     sqlx::query(
         r#"
         delete from public.chat_members
@@ -597,7 +991,6 @@ async fn update_chat_preferences(
     Json(payload): Json<UpdateChatPreferencesRequest>,
 ) -> Result<Json<ChatSummary>, ApiError> {
     ensure_chat_membership(&state.db, chat_id, user.id).await?;
-
     sqlx::query(
         r#"
         update public.chat_members
@@ -639,7 +1032,6 @@ async fn clear_chat_history(
     Json(payload): Json<ClearChatRequest>,
 ) -> Result<StatusCode, ApiError> {
     ensure_chat_membership(&state.db, chat_id, user.id).await?;
-
     match payload.scope {
         ClearChatScope::SelfOnly => clear_chat_for_self(&state.db, chat_id, user.id).await?,
         ClearChatScope::Everyone => clear_chat_for_everyone(&state.db, chat_id).await?,
@@ -959,6 +1351,86 @@ async fn ensure_chat_membership(db: &PgPool, chat_id: Uuid, user_id: Uuid) -> Re
             "user is not a member of this chat".to_string(),
         ))
     }
+}
+
+async fn ensure_device_ownership(
+    db: &PgPool,
+    device_id: Uuid,
+    user_id: Uuid,
+) -> Result<(), ApiError> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        r#"
+        select exists(
+            select 1
+            from public.e2ee_devices
+            where id = $1
+              and user_id = $2
+        )
+        "#,
+    )
+    .bind(device_id)
+    .bind(user_id)
+    .fetch_one(db)
+    .await?;
+
+    if exists {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden(
+            "device does not belong to the current user".to_string(),
+        ))
+    }
+}
+
+async fn ensure_device_exists(db: &PgPool, device_id: Uuid) -> Result<(), ApiError> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        r#"
+        select exists(
+            select 1
+            from public.e2ee_devices
+            where id = $1
+        )
+        "#,
+    )
+    .bind(device_id)
+    .fetch_one(db)
+    .await?;
+
+    if exists {
+        Ok(())
+    } else {
+        Err(ApiError::NotFound("receiver device not found".to_string()))
+    }
+}
+
+async fn consume_one_time_prekey(
+    tx: &mut Transaction<'_, Postgres>,
+    device_id: Uuid,
+) -> Result<Option<ClaimedOneTimePreKey>, ApiError> {
+    sqlx::query_as::<_, ClaimedOneTimePreKey>(
+        r#"
+        with claimed as (
+            update public.e2ee_one_time_prekeys
+            set claimed_at = timezone('utc', now())
+            where ctid in (
+                select ctid
+                from public.e2ee_one_time_prekeys
+                where device_id = $1
+                  and claimed_at is null
+                order by created_at asc, key_id asc
+                limit 1
+                for update skip locked
+            )
+            returning key_id, public_key
+        )
+        select key_id, public_key
+        from claimed
+        "#,
+    )
+    .bind(device_id)
+    .fetch_optional(tx.as_mut())
+    .await
+    .map_err(Into::into)
 }
 
 async fn touch_presence(db: &PgPool, user_id: Uuid) -> Result<(), ApiError> {
@@ -1584,6 +2056,56 @@ fn normalize_push_token(value: String) -> Result<String, ApiError> {
     Ok(value)
 }
 
+fn normalize_key_material(value: String, field_name: &str) -> Result<String, ApiError> {
+    let value = value.trim().to_string();
+
+    if value.is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "{field_name} must not be empty"
+        )));
+    }
+
+    if value.len() > 16_384 {
+        return Err(ApiError::BadRequest(format!(
+            "{field_name} exceeds the maximum allowed length"
+        )));
+    }
+
+    Ok(value)
+}
+
+fn normalize_one_time_prekeys(
+    prekeys: Vec<OneTimePreKeyUpload>,
+) -> Result<Vec<OneTimePreKeyUpload>, ApiError> {
+    let mut seen = BTreeSet::new();
+    let mut normalized = Vec::with_capacity(prekeys.len());
+
+    for prekey in prekeys {
+        let public_key = normalize_key_material(prekey.public_key, "one_time_prekeys.public_key")?;
+        if !seen.insert(prekey.key_id) {
+            return Err(ApiError::BadRequest(
+                "one_time_prekeys contains duplicate key_id values".to_string(),
+            ));
+        }
+
+        normalized.push(OneTimePreKeyUpload {
+            key_id: prekey.key_id,
+            public_key,
+        });
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_message_type(value: i16) -> Result<i16, ApiError> {
+    match value {
+        1 | 3 => Ok(value),
+        _ => Err(ApiError::BadRequest(
+            "message_type must be 1 or 3".to_string(),
+        )),
+    }
+}
+
 fn normalize_platform(value: String) -> Result<String, ApiError> {
     let value = value.trim().to_lowercase();
 
@@ -1596,6 +2118,20 @@ fn normalize_platform(value: String) -> Result<String, ApiError> {
 fn non_empty_or_none(value: String) -> Option<String> {
     let value = value.trim().to_string();
     if value.is_empty() { None } else { Some(value) }
+}
+
+fn to_pending_message_response(row: PendingMessageRow) -> PendingMessageResponse {
+    PendingMessageResponse {
+        id: row.id,
+        sender_user_id: row.sender_user_id,
+        sender_device_id: row.sender_device_id,
+        receiver_device_id: row.receiver_device_id,
+        message_type: row.message_type,
+        ciphertext: row.ciphertext,
+        client_message_id: row.client_message_id,
+        created_at: row.created_at,
+        delivered_at: row.delivered_at,
+    }
 }
 
 fn parse_receipt_status(value: &str) -> Option<ReceiptStatus> {
