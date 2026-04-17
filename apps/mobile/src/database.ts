@@ -10,6 +10,15 @@ type SignedPreKeyRow = {
   id: number;
   key_pair: string;
   signature: string;
+  created_at: number;
+};
+
+type IdentityVerificationRow = {
+  address: string;
+  safety_number: string;
+  verified: number;
+  verified_at: number | null;
+  updated_at: number;
 };
 
 type LocalDeviceStateRow = {
@@ -66,6 +75,21 @@ export type LocalE2EEMessage = {
   createdAt: number;
   deliveredAt?: number | null;
   ackedAt?: number | null;
+};
+
+export type SignedPreKeyRecord = {
+  id: number;
+  keyPair: string;
+  signature: string;
+  createdAt: number;
+};
+
+export type IdentityVerification = {
+  address: string;
+  safetyNumber: string;
+  verified: boolean;
+  verifiedAt?: number | null;
+  updatedAt: number;
 };
 
 export class DatabaseService {
@@ -128,6 +152,14 @@ export class DatabaseService {
       CREATE TABLE IF NOT EXISTS trusted_identities (
         address TEXT PRIMARY KEY NOT NULL,
         identity_key TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS identity_verifications (
+        address TEXT PRIMARY KEY NOT NULL,
+        safety_number TEXT NOT NULL,
+        verified INTEGER NOT NULL DEFAULT 0,
+        verified_at INTEGER,
         updated_at INTEGER NOT NULL
       );
 
@@ -276,10 +308,42 @@ export class DatabaseService {
     const database = await this.ready();
     return (
       (await database.getFirstAsync<SignedPreKeyRow>(
-        "SELECT id, key_pair, signature FROM signed_prekeys WHERE id = ?",
+        "SELECT id, key_pair, signature, created_at FROM signed_prekeys WHERE id = ?",
         id,
       )) ?? null
     );
+  }
+
+  async listSignedPreKeys(): Promise<SignedPreKeyRecord[]> {
+    const database = await this.ready();
+    const rows = await database.getAllAsync<SignedPreKeyRow>(
+      "SELECT id, key_pair, signature, created_at FROM signed_prekeys ORDER BY id ASC",
+    );
+
+    return rows.map((row) => ({
+      id: row.id,
+      keyPair: row.key_pair,
+      signature: row.signature,
+      createdAt: row.created_at,
+    }));
+  }
+
+  async getLatestSignedPreKey(): Promise<SignedPreKeyRecord | null> {
+    const database = await this.ready();
+    const row = await database.getFirstAsync<SignedPreKeyRow>(
+      "SELECT id, key_pair, signature, created_at FROM signed_prekeys ORDER BY id DESC LIMIT 1",
+    );
+
+    if (!row) {
+      return null;
+    }
+
+    return {
+      id: row.id,
+      keyPair: row.key_pair,
+      signature: row.signature,
+      createdAt: row.created_at,
+    };
   }
 
   async deleteSignedPreKey(id: number): Promise<void> {
@@ -336,6 +400,54 @@ export class DatabaseService {
       address: row.address,
       identityKey: row.identity_key,
     }));
+  }
+
+  async saveIdentityVerification(
+    address: string,
+    safetyNumber: string,
+    verified: boolean,
+    verifiedAt?: number | null,
+  ): Promise<void> {
+    const database = await this.ready();
+    await database.runAsync(
+      `INSERT INTO identity_verifications(address, safety_number, verified, verified_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(address) DO UPDATE SET
+         safety_number = excluded.safety_number,
+         verified = excluded.verified,
+         verified_at = excluded.verified_at,
+         updated_at = excluded.updated_at`,
+      address,
+      safetyNumber,
+      verified ? 1 : 0,
+      verifiedAt ?? null,
+      Date.now(),
+    );
+  }
+
+  async getIdentityVerification(address: string): Promise<IdentityVerification | null> {
+    const database = await this.ready();
+    const row = await database.getFirstAsync<IdentityVerificationRow>(
+      "SELECT address, safety_number, verified, verified_at, updated_at FROM identity_verifications WHERE address = ?",
+      address,
+    );
+
+    if (!row) {
+      return null;
+    }
+
+    return {
+      address: row.address,
+      safetyNumber: row.safety_number,
+      verified: row.verified === 1,
+      verifiedAt: row.verified_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  async clearIdentityVerification(address: string): Promise<void> {
+    const database = await this.ready();
+    await database.runAsync("DELETE FROM identity_verifications WHERE address = ?", address);
   }
 
   async saveLocalDeviceState(userId: string, deviceId: string, signalDeviceId: number | null): Promise<void> {

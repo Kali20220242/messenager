@@ -1,4 +1,12 @@
-import { KeyHelper, type KeyPairType, type PreKeyPairType, type SignedPreKeyPairType, Direction, setWebCrypto } from "@privacyresearch/libsignal-protocol-typescript";
+import {
+  FingerprintGenerator,
+  KeyHelper,
+  type KeyPairType,
+  type PreKeyPairType,
+  type SignedPreKeyPairType,
+  Direction,
+  setWebCrypto,
+} from "@privacyresearch/libsignal-protocol-typescript";
 import * as SecureStore from "expo-secure-store";
 import { Platform } from "react-native";
 import QuickCrypto, { install as installQuickCrypto } from "react-native-quick-crypto";
@@ -40,8 +48,18 @@ type PublishedPreKeyBundle = {
   }>;
 };
 
+export type SafetyNumberState = {
+  address: string;
+  safetyNumber: string;
+  verified: boolean;
+  verifiedAt?: number | null;
+  identityChanged: boolean;
+};
+
 const IDENTITY_KEY = "signal:identity-key";
 const REGISTRATION_ID_KEY = "signal:registration-id";
+const SAFETY_NUMBER_ITERATIONS = 5200;
+const SIGNED_PREKEY_ROTATION_AGE_MS = 1000 * 60 * 60 * 24 * 14;
 
 let runtimeInstalled = false;
 
@@ -121,8 +139,10 @@ export class SignalProtocolStore {
 
     const identityKeyPair = await this.ensureIdentityKeyPair();
     const registrationId = await this.ensureRegistrationId();
-    const signedPreKeyId = options.signedPreKeyId ?? 1;
-    const signedPreKey = await this.ensureSignedPreKey(identityKeyPair, signedPreKeyId);
+    const signedPreKey = await this.ensureActiveSignedPreKey(
+      identityKeyPair,
+      options.signedPreKeyId,
+    );
 
     return {
       identityKeyPair,
@@ -299,7 +319,60 @@ export class SignalProtocolStore {
     }
 
     await DB.saveTrustedIdentity(exact, encodedIdentityKey);
+    await DB.clearIdentityVerification(exact);
     return Boolean(existing && existing.identityKey !== encodedIdentityKey);
+  }
+
+  async getSafetyNumber(encodedAddress: string, localIdentifier: string): Promise<SafetyNumberState> {
+    await DB.init();
+    const identityKeyPair = await this.ensureIdentityKeyPair();
+    const { exact } = parseAddress(encodedAddress);
+    const remoteIdentity = await DB.getTrustedIdentity(exact);
+
+    if (!remoteIdentity) {
+      throw new Error("No trusted identity found for this address.");
+    }
+
+    const generator = new FingerprintGenerator(SAFETY_NUMBER_ITERATIONS);
+    const safetyNumber = await generator.createFor(
+      localIdentifier,
+      identityKeyPair.pubKey,
+      exact,
+      base64ToArrayBuffer(remoteIdentity.identityKey),
+    );
+
+    const verification = await DB.getIdentityVerification(exact);
+    return {
+      address: exact,
+      safetyNumber,
+      verified: verification?.verified === true && verification.safetyNumber === safetyNumber,
+      verifiedAt: verification?.verifiedAt ?? null,
+      identityChanged: verification != null && verification.safetyNumber !== safetyNumber,
+    };
+  }
+
+  async markSafetyNumberVerified(encodedAddress: string, localIdentifier: string): Promise<SafetyNumberState> {
+    const safetyNumberState = await this.getSafetyNumber(encodedAddress, localIdentifier);
+    const verifiedAt = Date.now();
+    await DB.saveIdentityVerification(
+      safetyNumberState.address,
+      safetyNumberState.safetyNumber,
+      true,
+      verifiedAt,
+    );
+
+    return {
+      ...safetyNumberState,
+      verified: true,
+      verifiedAt,
+      identityChanged: false,
+    };
+  }
+
+  async clearSafetyNumberVerification(encodedAddress: string): Promise<void> {
+    await DB.init();
+    const { exact } = parseAddress(encodedAddress);
+    await DB.clearIdentityVerification(exact);
   }
 
   async loadSignedPreKeyBundle(keyId: number): Promise<SignedPreKeyPairType | undefined> {
@@ -351,13 +424,33 @@ export class SignalProtocolStore {
     return generated;
   }
 
-  private async ensureSignedPreKey(identityKeyPair: KeyPairType, signedPreKeyId: number): Promise<SignedPreKeyPairType> {
-    const existing = await this.loadSignedPreKeyBundle(signedPreKeyId);
-    if (existing) {
-      return existing;
+  private async ensureActiveSignedPreKey(
+    identityKeyPair: KeyPairType,
+    preferredSignedPreKeyId?: number,
+  ): Promise<SignedPreKeyPairType> {
+    await DB.init();
+
+    if (preferredSignedPreKeyId != null) {
+      const preferred = await this.loadSignedPreKeyBundle(preferredSignedPreKeyId);
+      if (preferred) {
+        return preferred;
+      }
+
+      const generated = await KeyHelper.generateSignedPreKey(identityKeyPair, preferredSignedPreKeyId);
+      await this.saveSignedPreKeyBundle(generated);
+      return generated;
     }
 
-    const generated = await KeyHelper.generateSignedPreKey(identityKeyPair, signedPreKeyId);
+    const latest = await DB.getLatestSignedPreKey();
+    if (latest) {
+      const latestBundle = await this.loadSignedPreKeyBundle(latest.id);
+      if (latestBundle && Date.now() - latest.createdAt < SIGNED_PREKEY_ROTATION_AGE_MS) {
+        return latestBundle;
+      }
+    }
+
+    const nextKeyId = (latest?.id ?? 0) + 1;
+    const generated = await KeyHelper.generateSignedPreKey(identityKeyPair, nextKeyId);
     await this.saveSignedPreKeyBundle(generated);
     return generated;
   }

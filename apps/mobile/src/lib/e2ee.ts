@@ -54,6 +54,14 @@ export type DecryptedPendingMessage = {
   messageType: number;
 };
 
+export type SafetyNumber = {
+  address: string;
+  safetyNumber: string;
+  verified: boolean;
+  verifiedAt?: number | null;
+  identityChanged: boolean;
+};
+
 export class E2EEChatService {
   async uploadMyKeys(): Promise<LocalDeviceState> {
     const userId = await this.getCurrentUserId();
@@ -248,6 +256,23 @@ export class E2EEChatService {
 
     await this.maybeReplenishPreKeys();
     return decryptedMessages;
+  }
+
+  async getSafetyNumber(peerUserId: string, signalDeviceId: number): Promise<SafetyNumber> {
+    const currentUserId = await this.getCurrentUserId();
+    const address = new SignalProtocolAddress(peerUserId, signalDeviceId);
+    return signalStore.getSafetyNumber(address.toString(), currentUserId);
+  }
+
+  async verifySafetyNumber(peerUserId: string, signalDeviceId: number): Promise<SafetyNumber> {
+    const currentUserId = await this.getCurrentUserId();
+    const address = new SignalProtocolAddress(peerUserId, signalDeviceId);
+    return signalStore.markSafetyNumberVerified(address.toString(), currentUserId);
+  }
+
+  async clearSafetyNumberVerification(peerUserId: string, signalDeviceId: number): Promise<void> {
+    const address = new SignalProtocolAddress(peerUserId, signalDeviceId);
+    await signalStore.clearSafetyNumberVerification(address.toString());
   }
 
   private async decryptPendingMessage(message: E2EEPendingMessage): Promise<string> {
