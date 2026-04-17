@@ -44,9 +44,24 @@ type LocalE2EEMessageRow = {
   ciphertext: string;
   plaintext: string;
   status: string;
+  reply_to_client_message_id: string | null;
+  reply_to_preview: string | null;
+  forwarded_from_client_message_id: string | null;
+  forwarded_from_preview: string | null;
+  edited_at: number | null;
+  deleted_at: number | null;
   created_at: number;
   delivered_at: number | null;
   acked_at: number | null;
+};
+
+type ProcessedE2EEEventRow = {
+  id: string;
+  pending_message_id: string | null;
+  chat_id: string | null;
+  peer_user_id: string;
+  event_type: string;
+  created_at: number;
 };
 
 export type LocalDeviceState = {
@@ -72,9 +87,24 @@ export type LocalE2EEMessage = {
   ciphertext: string;
   plaintext: string;
   status: string;
+  replyToClientMessageId?: string | null;
+  replyToPreview?: string | null;
+  forwardedFromClientMessageId?: string | null;
+  forwardedFromPreview?: string | null;
+  editedAt?: number | null;
+  deletedAt?: number | null;
   createdAt: number;
   deliveredAt?: number | null;
   ackedAt?: number | null;
+};
+
+export type ProcessedE2EEEvent = {
+  id: string;
+  pendingMessageId?: string | null;
+  chatId?: string | null;
+  peerUserId: string;
+  eventType: string;
+  createdAt: number;
 };
 
 export type SignedPreKeyRecord = {
@@ -179,9 +209,24 @@ export class DatabaseService {
         ciphertext TEXT NOT NULL,
         plaintext TEXT NOT NULL,
         status TEXT NOT NULL,
+        reply_to_client_message_id TEXT,
+        reply_to_preview TEXT,
+        forwarded_from_client_message_id TEXT,
+        forwarded_from_preview TEXT,
+        edited_at INTEGER,
+        deleted_at INTEGER,
         created_at INTEGER NOT NULL,
         delivered_at INTEGER,
         acked_at INTEGER
+      );
+
+      CREATE TABLE IF NOT EXISTS processed_e2ee_events (
+        id TEXT PRIMARY KEY NOT NULL,
+        pending_message_id TEXT UNIQUE,
+        chat_id TEXT,
+        peer_user_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        created_at INTEGER NOT NULL
       );
 
       CREATE INDEX IF NOT EXISTS idx_messages_chat_id_created_at
@@ -200,7 +245,29 @@ export class DatabaseService {
 
       CREATE INDEX IF NOT EXISTS idx_e2ee_messages_peer_created_at
       ON e2ee_messages (peer_user_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_processed_e2ee_events_chat_created_at
+      ON processed_e2ee_events (chat_id, created_at DESC);
     `);
+
+    await database.execAsync(`
+      ALTER TABLE e2ee_messages ADD COLUMN reply_to_client_message_id TEXT;
+    `).catch(() => {});
+    await database.execAsync(`
+      ALTER TABLE e2ee_messages ADD COLUMN reply_to_preview TEXT;
+    `).catch(() => {});
+    await database.execAsync(`
+      ALTER TABLE e2ee_messages ADD COLUMN forwarded_from_client_message_id TEXT;
+    `).catch(() => {});
+    await database.execAsync(`
+      ALTER TABLE e2ee_messages ADD COLUMN forwarded_from_preview TEXT;
+    `).catch(() => {});
+    await database.execAsync(`
+      ALTER TABLE e2ee_messages ADD COLUMN edited_at INTEGER;
+    `).catch(() => {});
+    await database.execAsync(`
+      ALTER TABLE e2ee_messages ADD COLUMN deleted_at INTEGER;
+    `).catch(() => {});
 
     this.initialized = true;
   }
@@ -504,11 +571,17 @@ export class DatabaseService {
          ciphertext,
          plaintext,
          status,
+         reply_to_client_message_id,
+         reply_to_preview,
+         forwarded_from_client_message_id,
+         forwarded_from_preview,
+         edited_at,
+         deleted_at,
          created_at,
          delivered_at,
          acked_at
        )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          pending_message_id = excluded.pending_message_id,
          client_message_id = excluded.client_message_id,
@@ -524,6 +597,12 @@ export class DatabaseService {
          ciphertext = excluded.ciphertext,
          plaintext = excluded.plaintext,
          status = excluded.status,
+         reply_to_client_message_id = excluded.reply_to_client_message_id,
+         reply_to_preview = excluded.reply_to_preview,
+         forwarded_from_client_message_id = excluded.forwarded_from_client_message_id,
+         forwarded_from_preview = excluded.forwarded_from_preview,
+         edited_at = excluded.edited_at,
+         deleted_at = excluded.deleted_at,
          created_at = excluded.created_at,
          delivered_at = excluded.delivered_at,
          acked_at = excluded.acked_at`,
@@ -542,6 +621,12 @@ export class DatabaseService {
       message.ciphertext,
       message.plaintext,
       message.status,
+      message.replyToClientMessageId ?? null,
+      message.replyToPreview ?? null,
+      message.forwardedFromClientMessageId ?? null,
+      message.forwardedFromPreview ?? null,
+      message.editedAt ?? null,
+      message.deletedAt ?? null,
       message.createdAt,
       message.deliveredAt ?? null,
       message.ackedAt ?? null,
@@ -568,6 +653,17 @@ export class DatabaseService {
     return rows.map((row) => this.mapLocalE2EEMessage(row));
   }
 
+  async getLocalE2EEMessageByClientMessageId(clientMessageId: string): Promise<LocalE2EEMessage | null> {
+    const database = await this.ready();
+    const row = await database.getFirstAsync<LocalE2EEMessageRow>(
+      "SELECT * FROM e2ee_messages WHERE client_message_id = ? OR id = ? LIMIT 1",
+      clientMessageId,
+      clientMessageId,
+    );
+
+    return row ? this.mapLocalE2EEMessage(row) : null;
+  }
+
   async listLocalE2EEMessagesForChat(chatId: string, peerUserId?: string): Promise<LocalE2EEMessage[]> {
     const database = await this.ready();
 
@@ -590,6 +686,69 @@ export class DatabaseService {
       );
 
     return rows.map((row) => this.mapLocalE2EEMessage(row));
+  }
+
+  async listInboundMessagesPendingSeen(chatId: string, peerUserId: string): Promise<LocalE2EEMessage[]> {
+    const database = await this.ready();
+    const rows = await database.getAllAsync<LocalE2EEMessageRow>(
+      `SELECT *
+       FROM e2ee_messages
+       WHERE chat_id = ?
+         AND peer_user_id = ?
+         AND direction = 'inbound'
+         AND deleted_at IS NULL
+         AND status <> 'seen'
+       ORDER BY created_at ASC, id ASC`,
+      chatId,
+      peerUserId,
+    );
+
+    return rows.map((row) => this.mapLocalE2EEMessage(row));
+  }
+
+  async deleteLocalE2EEMessagesForChat(chatId: string): Promise<void> {
+    const database = await this.ready();
+    await database.runAsync("DELETE FROM e2ee_messages WHERE chat_id = ?", chatId);
+    await database.runAsync("DELETE FROM processed_e2ee_events WHERE chat_id = ?", chatId);
+  }
+
+  async deleteLocalE2EEMessageByClientMessageId(clientMessageId: string): Promise<void> {
+    const database = await this.ready();
+    await database.runAsync(
+      "DELETE FROM e2ee_messages WHERE client_message_id = ? OR id = ?",
+      clientMessageId,
+      clientMessageId,
+    );
+  }
+
+  async saveProcessedE2EEEvent(event: ProcessedE2EEEvent): Promise<void> {
+    const database = await this.ready();
+    await database.runAsync(
+      `INSERT INTO processed_e2ee_events(id, pending_message_id, chat_id, peer_user_id, event_type, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         pending_message_id = excluded.pending_message_id,
+         chat_id = excluded.chat_id,
+         peer_user_id = excluded.peer_user_id,
+         event_type = excluded.event_type,
+         created_at = excluded.created_at`,
+      event.id,
+      event.pendingMessageId ?? null,
+      event.chatId ?? null,
+      event.peerUserId,
+      event.eventType,
+      event.createdAt,
+    );
+  }
+
+  async getProcessedE2EEEventByPendingId(pendingMessageId: string): Promise<ProcessedE2EEEvent | null> {
+    const database = await this.ready();
+    const row = await database.getFirstAsync<ProcessedE2EEEventRow>(
+      "SELECT * FROM processed_e2ee_events WHERE pending_message_id = ?",
+      pendingMessageId,
+    );
+
+    return row ? this.mapProcessedE2EEEvent(row) : null;
   }
 
   async withTransaction<T>(task: () => Promise<T>): Promise<T> {
@@ -631,9 +790,26 @@ export class DatabaseService {
       ciphertext: row.ciphertext,
       plaintext: row.plaintext,
       status: row.status,
+      replyToClientMessageId: row.reply_to_client_message_id,
+      replyToPreview: row.reply_to_preview,
+      forwardedFromClientMessageId: row.forwarded_from_client_message_id,
+      forwardedFromPreview: row.forwarded_from_preview,
+      editedAt: row.edited_at,
+      deletedAt: row.deleted_at,
       createdAt: row.created_at,
       deliveredAt: row.delivered_at,
       ackedAt: row.acked_at,
+    };
+  }
+
+  private mapProcessedE2EEEvent(row: ProcessedE2EEEventRow): ProcessedE2EEEvent {
+    return {
+      id: row.id,
+      pendingMessageId: row.pending_message_id,
+      chatId: row.chat_id,
+      peerUserId: row.peer_user_id,
+      eventType: row.event_type,
+      createdAt: row.created_at,
     };
   }
 }

@@ -29,6 +29,29 @@ const INITIAL_PREKEY_BATCH = 100;
 const PREKEY_REPLENISH_THRESHOLD = 20;
 const PREKEY_REPLENISH_BATCH = 100;
 
+type E2EEEventKind = "message" | "edit" | "delete" | "receipt";
+type E2EEReceiptStatus = "delivered" | "seen";
+
+type E2EEMessageEnvelope = {
+  event_id: string;
+  kind: E2EEEventKind;
+  sent_at: string;
+  chat_id?: string | null;
+  body?: string;
+  target_client_message_id?: string | null;
+  reply_to_client_message_id?: string | null;
+  reply_to_preview?: string | null;
+  forwarded_from_client_message_id?: string | null;
+  forwarded_from_preview?: string | null;
+  receipt_status?: E2EEReceiptStatus;
+};
+
+type E2EEEventSummary = {
+  event_type: E2EEEventKind;
+  preview_text?: string | null;
+  target_client_message_id?: string | null;
+};
+
 export type PeerBundle = {
   userId: string;
   deviceId: string;
@@ -43,6 +66,14 @@ export type SendEncryptedMessageInput = {
   chatId?: string | null;
   clientMessageId?: string;
   targetDeviceIds?: string[];
+  replyToMessage?: {
+    clientMessageId: string;
+    preview: string;
+  } | null;
+  forwardedFromMessage?: {
+    clientMessageId: string;
+    preview: string;
+  } | null;
 };
 
 export type DecryptedPendingMessage = {
@@ -52,6 +83,8 @@ export type DecryptedPendingMessage = {
   plaintext: string;
   createdAt: number;
   messageType: number;
+  kind: E2EEEventKind;
+  targetClientMessageId?: string | null;
 };
 
 export type SafetyNumber = {
@@ -60,6 +93,19 @@ export type SafetyNumber = {
   verified: boolean;
   verifiedAt?: number | null;
   identityChanged: boolean;
+};
+
+export type SendE2EEEditInput = {
+  peerUserId: string;
+  chatId: string;
+  targetClientMessageId: string;
+  plaintext: string;
+};
+
+export type SendE2EEDeleteInput = {
+  peerUserId: string;
+  chatId: string;
+  targetClientMessageId: string;
 };
 
 export class E2EEChatService {
@@ -124,6 +170,17 @@ export class E2EEChatService {
     }
 
     const clientMessageId = input.clientMessageId ?? createUuid();
+    const envelope: E2EEMessageEnvelope = {
+      event_id: clientMessageId,
+      kind: "message",
+      chat_id: input.chatId ?? null,
+      body: input.plaintext,
+      sent_at: new Date().toISOString(),
+      reply_to_client_message_id: input.replyToMessage?.clientMessageId ?? null,
+      reply_to_preview: input.replyToMessage?.preview ?? null,
+      forwarded_from_client_message_id: input.forwardedFromMessage?.clientMessageId ?? null,
+      forwarded_from_preview: input.forwardedFromMessage?.preview ?? null,
+    };
     const deliveries: Array<{ deviceId: string; signalDeviceId: number; messageType: number }> = [];
     let firstEnvelope: {
       messageType: number;
@@ -133,12 +190,7 @@ export class E2EEChatService {
     } | null = null;
 
     for (const bundle of targetBundles) {
-      const address = new SignalProtocolAddress(bundle.userId, bundle.signalDeviceId);
-      const sessionBuilder = new SessionBuilder(signalStore, address);
-      await sessionBuilder.processPreKey(bundle.bundle);
-
-      const sessionCipher = new SessionCipher(signalStore, address);
-      const encryptedMessage = await sessionCipher.encrypt(utf8ToArrayBuffer(input.plaintext));
+      const encryptedMessage = await this.encryptEnvelopeForPeerBundle(bundle, envelope);
 
       if (!encryptedMessage.body) {
         throw new Error("libsignal returned an empty ciphertext body.");
@@ -151,6 +203,7 @@ export class E2EEChatService {
         message_type: encryptedMessage.type,
         ciphertext: encryptedMessage.body,
         client_message_id: clientMessageId,
+        event_summary: this.buildEventSummary(envelope),
       });
 
       deliveries.push({
@@ -183,6 +236,10 @@ export class E2EEChatService {
         ciphertext: firstEnvelope.ciphertext,
         plaintext: input.plaintext,
         status: "sent",
+        replyToClientMessageId: envelope.reply_to_client_message_id ?? null,
+        replyToPreview: envelope.reply_to_preview ?? null,
+        forwardedFromClientMessageId: envelope.forwarded_from_client_message_id ?? null,
+        forwardedFromPreview: envelope.forwarded_from_preview ?? null,
         createdAt: Date.now(),
       });
     }
@@ -199,59 +256,42 @@ export class E2EEChatService {
     const decryptedMessages: DecryptedPendingMessage[] = [];
 
     for (const pendingMessage of pendingMessages) {
-      const existingMessage = await DB.getLocalE2EEMessageByPendingId(pendingMessage.id);
-      if (existingMessage) {
+      const existingEvent = await DB.getProcessedE2EEEventByPendingId(pendingMessage.id);
+      if (existingEvent) {
         await ackE2EEPendingMessage(localDeviceState.deviceId, pendingMessage.id);
-        const ackedAt = Date.now();
-        await DB.saveLocalE2EEMessage({
-          ...existingMessage,
-          ackedAt,
-          status: "received",
-        });
         continue;
       }
 
-      const decrypted = await this.decryptPendingMessage(pendingMessage);
-      const storedMessage: LocalE2EEMessage = {
-        id: pendingMessage.client_message_id ?? pendingMessage.id,
-        pendingMessageId: pendingMessage.id,
-        clientMessageId: pendingMessage.client_message_id ?? null,
-        chatId: pendingMessage.chat_id ?? null,
-        peerUserId: pendingMessage.sender_user_id,
-        direction: "inbound",
-        senderUserId: pendingMessage.sender_user_id,
-        senderDeviceId: pendingMessage.sender_device_id,
-        senderSignalDeviceId: pendingMessage.sender_signal_device_id,
-        receiverDeviceId: pendingMessage.receiver_device_id,
-        receiverSignalDeviceId: pendingMessage.receiver_signal_device_id,
-        messageType: pendingMessage.message_type,
-        ciphertext: pendingMessage.ciphertext,
-        plaintext: decrypted,
-        status: "received",
-        createdAt: Date.parse(pendingMessage.created_at),
-        deliveredAt: pendingMessage.delivered_at ? Date.parse(pendingMessage.delivered_at) : null,
-      };
+      const { envelope, plaintext } = await this.decryptPendingMessage(pendingMessage);
+      const shouldSendDeliveredReceipt = envelope.kind === "message";
 
       await DB.withTransaction(async () => {
-        await DB.saveLocalE2EEMessage(storedMessage);
+        await this.applyDecryptedEnvelope(pendingMessage, envelope, plaintext);
       });
 
       await ackE2EEPendingMessage(localDeviceState.deviceId, pendingMessage.id);
-
-      const ackedAt = Date.now();
-      await DB.saveLocalE2EEMessage({
-        ...storedMessage,
-        ackedAt,
-      });
 
       decryptedMessages.push({
         pendingMessageId: pendingMessage.id,
         chatId: pendingMessage.chat_id ?? null,
         peerUserId: pendingMessage.sender_user_id,
-        plaintext: decrypted,
-        createdAt: storedMessage.createdAt,
+        plaintext,
+        createdAt: Date.parse(envelope.sent_at || pendingMessage.created_at),
         messageType: pendingMessage.message_type,
+        kind: envelope.kind,
+        targetClientMessageId: envelope.target_client_message_id ?? null,
       });
+
+      if (shouldSendDeliveredReceipt && pendingMessage.chat_id) {
+        await this.sendReceiptForInboundMessage(
+          pendingMessage.sender_user_id,
+          pendingMessage.chat_id,
+          pendingMessage.client_message_id ?? envelope.event_id,
+          "delivered",
+          pendingMessage.sender_device_id,
+          pendingMessage.sender_signal_device_id,
+        );
+      }
     }
 
     await this.maybeReplenishPreKeys();
@@ -275,7 +315,82 @@ export class E2EEChatService {
     await signalStore.clearSafetyNumberVerification(address.toString());
   }
 
-  private async decryptPendingMessage(message: E2EEPendingMessage): Promise<string> {
+  async sendEditMessage(input: SendE2EEEditInput): Promise<void> {
+    const targetMessage = await DB.getLocalE2EEMessageByClientMessageId(input.targetClientMessageId);
+    if (!targetMessage) {
+      throw new Error("Target message for edit was not found locally.");
+    }
+
+    const eventId = createUuid();
+    const envelope: E2EEMessageEnvelope = {
+      event_id: eventId,
+      kind: "edit",
+      chat_id: input.chatId,
+      body: input.plaintext,
+      target_client_message_id: input.targetClientMessageId,
+      sent_at: new Date().toISOString(),
+    };
+
+    await this.sendEnvelopeToPeer(input.peerUserId, input.chatId, envelope);
+    await DB.saveLocalE2EEMessage({
+      ...targetMessage,
+      plaintext: input.plaintext,
+      editedAt: Date.now(),
+    });
+  }
+
+  async sendDeleteMessage(input: SendE2EEDeleteInput): Promise<void> {
+    const targetMessage = await DB.getLocalE2EEMessageByClientMessageId(input.targetClientMessageId);
+    if (!targetMessage) {
+      throw new Error("Target message for deletion was not found locally.");
+    }
+
+    const eventId = createUuid();
+    const envelope: E2EEMessageEnvelope = {
+      event_id: eventId,
+      kind: "delete",
+      chat_id: input.chatId,
+      target_client_message_id: input.targetClientMessageId,
+      sent_at: new Date().toISOString(),
+    };
+
+    await this.sendEnvelopeToPeer(input.peerUserId, input.chatId, envelope);
+    await DB.saveLocalE2EEMessage({
+      ...targetMessage,
+      deletedAt: Date.now(),
+      editedAt: null,
+      plaintext: "",
+    });
+  }
+
+  async markChatSeen(chatId: string, peerUserId: string): Promise<void> {
+    const inboundMessages = await DB.listInboundMessagesPendingSeen(chatId, peerUserId);
+
+    for (const message of inboundMessages) {
+      if (!message.clientMessageId || !message.senderDeviceId || !message.senderSignalDeviceId) {
+        continue;
+      }
+
+      await this.sendReceiptForInboundMessage(
+        peerUserId,
+        chatId,
+        message.clientMessageId,
+        "seen",
+        message.senderDeviceId,
+        message.senderSignalDeviceId,
+      );
+
+      await DB.saveLocalE2EEMessage({
+        ...message,
+        status: "seen",
+      });
+    }
+  }
+
+  private async decryptPendingMessage(message: E2EEPendingMessage): Promise<{
+    envelope: E2EEMessageEnvelope;
+    plaintext: string;
+  }> {
     const remoteAddress = new SignalProtocolAddress(
       message.sender_user_id,
       message.sender_signal_device_id,
@@ -289,7 +404,94 @@ export class E2EEChatService {
       plaintextBuffer = await sessionCipher.decryptWhisperMessage(message.ciphertext, "binary");
     }
 
-    return arrayBufferToUtf8(plaintextBuffer);
+    const plaintext = arrayBufferToUtf8(plaintextBuffer);
+    return {
+      envelope: this.parseEnvelope(
+        plaintext,
+        message.client_message_id ?? message.id,
+        message.chat_id ?? null,
+        message.created_at,
+      ),
+      plaintext,
+    };
+  }
+
+  private async applyDecryptedEnvelope(
+    pendingMessage: E2EEPendingMessage,
+    envelope: E2EEMessageEnvelope,
+    plaintext: string,
+  ): Promise<void> {
+    const createdAt = Date.parse(envelope.sent_at || pendingMessage.created_at);
+    const processedEventId = envelope.event_id || pendingMessage.client_message_id || pendingMessage.id;
+
+    if (envelope.kind === "message") {
+      await DB.saveLocalE2EEMessage({
+        id: envelope.event_id,
+        pendingMessageId: pendingMessage.id,
+        clientMessageId: envelope.event_id,
+        chatId: pendingMessage.chat_id ?? envelope.chat_id ?? null,
+        peerUserId: pendingMessage.sender_user_id,
+        direction: "inbound",
+        senderUserId: pendingMessage.sender_user_id,
+        senderDeviceId: pendingMessage.sender_device_id,
+        senderSignalDeviceId: pendingMessage.sender_signal_device_id,
+        receiverDeviceId: pendingMessage.receiver_device_id,
+        receiverSignalDeviceId: pendingMessage.receiver_signal_device_id,
+        messageType: pendingMessage.message_type,
+        ciphertext: pendingMessage.ciphertext,
+        plaintext: envelope.body ?? plaintext,
+        status: "received",
+        replyToClientMessageId: envelope.reply_to_client_message_id ?? null,
+        replyToPreview: envelope.reply_to_preview ?? null,
+        forwardedFromClientMessageId: envelope.forwarded_from_client_message_id ?? null,
+        forwardedFromPreview: envelope.forwarded_from_preview ?? null,
+        createdAt,
+        deliveredAt: pendingMessage.delivered_at ? Date.parse(pendingMessage.delivered_at) : null,
+        ackedAt: Date.now(),
+      });
+    } else if (envelope.kind === "edit" && envelope.target_client_message_id) {
+      const targetMessage = await DB.getLocalE2EEMessageByClientMessageId(envelope.target_client_message_id);
+      if (targetMessage) {
+        await DB.saveLocalE2EEMessage({
+          ...targetMessage,
+          plaintext: envelope.body ?? targetMessage.plaintext,
+          editedAt: Date.now(),
+        });
+      }
+    } else if (envelope.kind === "delete" && envelope.target_client_message_id) {
+      const targetMessage = await DB.getLocalE2EEMessageByClientMessageId(envelope.target_client_message_id);
+      if (targetMessage) {
+        await DB.saveLocalE2EEMessage({
+          ...targetMessage,
+          deletedAt: Date.now(),
+          editedAt: null,
+          plaintext: "",
+        });
+      }
+    } else if (
+      envelope.kind === "receipt"
+      && envelope.target_client_message_id
+      && envelope.receipt_status
+    ) {
+      const targetMessage = await DB.getLocalE2EEMessageByClientMessageId(envelope.target_client_message_id);
+      if (targetMessage) {
+        await DB.saveLocalE2EEMessage({
+          ...targetMessage,
+          status: this.nextReceiptStatus(targetMessage.status, envelope.receipt_status),
+          deliveredAt: envelope.receipt_status === "delivered" ? Date.now() : targetMessage.deliveredAt ?? Date.now(),
+          ackedAt: envelope.receipt_status === "seen" ? Date.now() : targetMessage.ackedAt,
+        });
+      }
+    }
+
+    await DB.saveProcessedE2EEEvent({
+      id: processedEventId,
+      pendingMessageId: pendingMessage.id,
+      chatId: pendingMessage.chat_id ?? envelope.chat_id ?? null,
+      peerUserId: pendingMessage.sender_user_id,
+      eventType: envelope.kind,
+      createdAt,
+    });
   }
 
   private mapPeerBundle(userId: string, bundle: E2EEDeviceBundle): PeerBundle {
@@ -361,6 +563,167 @@ export class E2EEChatService {
     }
 
     return userId;
+  }
+
+  private parseEnvelope(
+    plaintext: string,
+    fallbackEventId: string,
+    fallbackChatId: string | null,
+    fallbackCreatedAt: string,
+  ): E2EEMessageEnvelope {
+    try {
+      const parsed = JSON.parse(plaintext) as Partial<E2EEMessageEnvelope>;
+      if (parsed && typeof parsed.kind === "string" && typeof parsed.event_id === "string") {
+        return {
+          event_id: parsed.event_id,
+          kind: parsed.kind,
+          sent_at: parsed.sent_at ?? fallbackCreatedAt,
+          chat_id: parsed.chat_id ?? fallbackChatId,
+          body: parsed.body,
+          target_client_message_id: parsed.target_client_message_id ?? null,
+          reply_to_client_message_id: parsed.reply_to_client_message_id ?? null,
+          reply_to_preview: parsed.reply_to_preview ?? null,
+          forwarded_from_client_message_id: parsed.forwarded_from_client_message_id ?? null,
+          forwarded_from_preview: parsed.forwarded_from_preview ?? null,
+          receipt_status: parsed.receipt_status,
+        };
+      }
+    } catch {
+      // Backward-compatible fallback for older plaintext-only secure messages.
+    }
+
+    return {
+      event_id: fallbackEventId,
+      kind: "message",
+      sent_at: fallbackCreatedAt,
+      chat_id: fallbackChatId,
+      body: plaintext,
+    };
+  }
+
+  private buildEventSummary(envelope: E2EEMessageEnvelope): E2EEEventSummary {
+    switch (envelope.kind) {
+      case "message":
+        return {
+          event_type: "message",
+          preview_text: envelope.body ?? null,
+        };
+      case "edit":
+        return {
+          event_type: "edit",
+          preview_text: envelope.body ?? null,
+          target_client_message_id: envelope.target_client_message_id ?? null,
+        };
+      case "delete":
+        return {
+          event_type: "delete",
+          preview_text: "Message deleted",
+          target_client_message_id: envelope.target_client_message_id ?? null,
+        };
+      case "receipt":
+        return {
+          event_type: "receipt",
+          target_client_message_id: envelope.target_client_message_id ?? null,
+        };
+      default:
+        return {
+          event_type: "message",
+          preview_text: envelope.body ?? null,
+        };
+    }
+  }
+
+  private async encryptEnvelopeForPeerBundle(bundle: PeerBundle, envelope: E2EEMessageEnvelope) {
+    const address = new SignalProtocolAddress(bundle.userId, bundle.signalDeviceId);
+    const sessionBuilder = new SessionBuilder(signalStore, address);
+    await sessionBuilder.processPreKey(bundle.bundle);
+
+    const sessionCipher = new SessionCipher(signalStore, address);
+    return sessionCipher.encrypt(utf8ToArrayBuffer(JSON.stringify(envelope)));
+  }
+
+  private async sendEnvelopeToPeer(
+    peerUserId: string,
+    chatId: string,
+    envelope: E2EEMessageEnvelope,
+  ): Promise<void> {
+    const localDeviceState = await this.ensureUploadedDeviceState();
+    const peerBundles = await this.fetchPeerBundles(peerUserId);
+
+    for (const bundle of peerBundles) {
+      const encryptedMessage = await this.encryptEnvelopeForPeerBundle(bundle, envelope);
+      if (!encryptedMessage.body) {
+        throw new Error("libsignal returned an empty ciphertext body.");
+      }
+
+      await sendE2EEPendingMessage({
+        sender_device_id: localDeviceState.deviceId,
+        receiver_device_id: bundle.deviceId,
+        chat_id: chatId,
+        message_type: encryptedMessage.type,
+        ciphertext: encryptedMessage.body,
+        client_message_id: envelope.event_id,
+        event_summary: this.buildEventSummary(envelope),
+      });
+    }
+  }
+
+  private async sendReceiptForInboundMessage(
+    peerUserId: string,
+    chatId: string,
+    targetClientMessageId: string,
+    receiptStatus: E2EEReceiptStatus,
+    receiverDeviceId: string,
+    receiverSignalDeviceId: number,
+  ): Promise<void> {
+    const localDeviceState = await this.ensureUploadedDeviceState();
+    const currentUserId = await this.getCurrentUserId();
+    const address = new SignalProtocolAddress(peerUserId, receiverSignalDeviceId);
+    const sessionCipher = new SessionCipher(signalStore, address);
+    const envelope: E2EEMessageEnvelope = {
+      event_id: createUuid(),
+      kind: "receipt",
+      chat_id: chatId,
+      target_client_message_id: targetClientMessageId,
+      receipt_status: receiptStatus,
+      sent_at: new Date().toISOString(),
+    };
+    const encryptedMessage = await sessionCipher.encrypt(
+      utf8ToArrayBuffer(JSON.stringify(envelope)),
+    );
+
+    if (!encryptedMessage.body) {
+      throw new Error("libsignal returned an empty ciphertext body.");
+    }
+
+    await sendE2EEPendingMessage({
+      sender_device_id: localDeviceState.deviceId,
+      receiver_device_id: receiverDeviceId,
+      chat_id: chatId,
+      message_type: encryptedMessage.type,
+      ciphertext: encryptedMessage.body,
+      client_message_id: envelope.event_id,
+      event_summary: this.buildEventSummary(envelope),
+    });
+
+    await DB.saveProcessedE2EEEvent({
+      id: envelope.event_id,
+      chatId,
+      peerUserId: currentUserId,
+      eventType: "receipt",
+      createdAt: Date.now(),
+    });
+  }
+
+  private nextReceiptStatus(currentStatus: string, incomingStatus: E2EEReceiptStatus): string {
+    const ranks: Record<string, number> = {
+      sent: 0,
+      received: 0,
+      delivered: 1,
+      seen: 2,
+    };
+
+    return (ranks[incomingStatus] >= (ranks[currentStatus] ?? 0)) ? incomingStatus : currentStatus;
   }
 }
 

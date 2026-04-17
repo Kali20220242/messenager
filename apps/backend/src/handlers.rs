@@ -266,6 +266,14 @@ struct EnqueuePendingMessageRequest {
     message_type: i16,
     ciphertext: String,
     client_message_id: Option<Uuid>,
+    event_summary: Option<PendingEventSummaryRequest>,
+}
+
+#[derive(Deserialize)]
+struct PendingEventSummaryRequest {
+    event_type: String,
+    preview_text: Option<String>,
+    target_client_message_id: Option<Uuid>,
 }
 
 #[derive(Serialize, FromRow)]
@@ -366,6 +374,7 @@ pub fn router(state: AppState) -> Router {
         .route("/contacts/discover", post(discover_contacts))
         .route("/chats", get(list_chats))
         .route("/chats/{chat_id}", axum::routing::delete(delete_chat))
+        .route("/chats/{chat_id}/read", post(mark_chat_read_now))
         .route(
             "/chats/{chat_id}/preferences",
             patch(update_chat_preferences),
@@ -694,6 +703,7 @@ async fn enqueue_pending_message(
 
     let ciphertext = normalize_key_material(payload.ciphertext, "ciphertext")?;
     let message_type = normalize_message_type(payload.message_type)?;
+    let event_summary = normalize_pending_event_summary(payload.event_summary)?;
 
     let row = sqlx::query_as::<_, PendingMessageRow>(
         r#"
@@ -749,6 +759,20 @@ async fn enqueue_pending_message(
     .bind(payload.client_message_id)
     .fetch_one(&state.db)
     .await?;
+
+    if let (Some(chat_id), Some(client_message_id), Some(summary)) =
+        (payload.chat_id, payload.client_message_id, event_summary)
+    {
+        record_e2ee_chat_event(
+            &state.db,
+            chat_id,
+            user.id,
+            payload.sender_device_id,
+            client_message_id,
+            summary,
+        )
+        .await?;
+    }
 
     let push_tokens =
         fetch_push_tokens_for_e2ee_delivery(&state.db, payload.receiver_device_id, payload.chat_id)
@@ -934,10 +958,7 @@ async fn list_chats(
             peer.username as peer_username,
             peer.avatar_path as peer_avatar_path,
             peer.last_seen_at as peer_last_seen_at,
-            case
-                when lm.deleted_at is not null then 'Message deleted'
-                else lm.body
-            end as last_message,
+            lm.preview_text as last_message,
             lm.created_at as last_message_at,
             coalesce(lm.created_at, c.created_at) as activity_at,
             coalesce(unread.unread_count, 0) as unread_count,
@@ -955,41 +976,30 @@ async fn list_chats(
         join public.profiles peer
             on peer.id = peer_member.user_id
         left join lateral (
-            select m.body, m.created_at, m.deleted_at
-            from public.messages m
-            where m.chat_id = c.id
-              and not exists (
-                  select 1
-                  from public.message_hidden_for_users hidden
-                  where hidden.message_id = m.id
-                    and hidden.user_id = $1
-              )
+            select e.preview_text, e.created_at
+            from public.e2ee_chat_events e
+            where e.chat_id = c.id
+              and e.event_type <> 'receipt'
               and (
                   self_member.cleared_at is null
-                  or m.created_at > self_member.cleared_at
+                  or e.created_at > self_member.cleared_at
               )
-            order by m.created_at desc
+            order by e.created_at desc, e.id desc
             limit 1
         ) lm on true
         left join lateral (
             select count(*)::bigint as unread_count
-            from public.messages m
-            where m.chat_id = c.id
-              and m.sender_id <> $1
-              and m.deleted_at is null
-              and not exists (
-                  select 1
-                  from public.message_hidden_for_users hidden
-                  where hidden.message_id = m.id
-                    and hidden.user_id = $1
-              )
+            from public.e2ee_chat_events e
+            where e.chat_id = c.id
+              and e.sender_user_id <> $1
+              and e.event_type = 'message'
               and (
                   self_member.cleared_at is null
-                  or m.created_at > self_member.cleared_at
+                  or e.created_at > self_member.cleared_at
               )
               and (
                   self_member.last_read_at is null
-                  or m.created_at > self_member.last_read_at
+                  or e.created_at > self_member.last_read_at
               )
         ) unread on true
         where c.is_group = false
@@ -1100,6 +1110,16 @@ async fn clear_chat_history(
         ClearChatScope::Everyone => clear_chat_for_everyone(&state.db, chat_id).await?,
     }
 
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn mark_chat_read_now(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(chat_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    ensure_chat_membership(&state.db, chat_id, user.id).await?;
+    mark_chat_read(&state.db, chat_id, user.id, None).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1769,6 +1789,16 @@ async fn clear_chat_for_everyone(db: &PgPool, chat_id: Uuid) -> Result<(), ApiEr
 
     sqlx::query(
         r#"
+        delete from public.e2ee_chat_events
+        where chat_id = $1
+        "#,
+    )
+    .bind(chat_id)
+    .execute(tx.as_mut())
+    .await?;
+
+    sqlx::query(
+        r#"
         update public.chat_members
         set cleared_at = null,
             last_delivered_at = null,
@@ -1860,13 +1890,10 @@ async fn fetch_chat_summary(
             peer.username as peer_username,
             peer.avatar_path as peer_avatar_path,
             peer.last_seen_at as peer_last_seen_at,
-            case
-                when lm.deleted_at is not null then 'Message deleted'
-                else lm.body
-            end as last_message,
+            lm.preview_text as last_message,
             lm.created_at as last_message_at,
             coalesce(lm.created_at, c.created_at) as activity_at,
-            0::bigint as unread_count,
+            coalesce(unread.unread_count, 0) as unread_count,
             self_member.archived_at is not null as is_archived,
             self_member.pinned_at is not null as is_pinned,
             self_member.muted_until is not null
@@ -1881,22 +1908,32 @@ async fn fetch_chat_summary(
         join public.profiles peer
             on peer.id = peer_member.user_id
         left join lateral (
-            select m.body, m.created_at, m.deleted_at
-            from public.messages m
-            where m.chat_id = c.id
-              and not exists (
-                  select 1
-                  from public.message_hidden_for_users hidden
-                  where hidden.message_id = m.id
-                    and hidden.user_id = $2
-              )
+            select e.preview_text, e.created_at
+            from public.e2ee_chat_events e
+            where e.chat_id = c.id
+              and e.event_type <> 'receipt'
               and (
                   self_member.cleared_at is null
-                  or m.created_at > self_member.cleared_at
+                  or e.created_at > self_member.cleared_at
               )
-            order by m.created_at desc
+            order by e.created_at desc, e.id desc
             limit 1
         ) lm on true
+        left join lateral (
+            select count(*)::bigint as unread_count
+            from public.e2ee_chat_events e
+            where e.chat_id = c.id
+              and e.sender_user_id <> $2
+              and e.event_type = 'message'
+              and (
+                  self_member.cleared_at is null
+                  or e.created_at > self_member.cleared_at
+              )
+              and (
+                  self_member.last_read_at is null
+                  or e.created_at > self_member.last_read_at
+              )
+        ) unread on true
         where c.id = $1
         limit 1
         "#,
@@ -1914,7 +1951,7 @@ async fn fetch_chat_summary(
             last_message: row.last_message,
             last_message_at: row.last_message_at,
             activity_at: row.activity_at,
-            unread_count: 0,
+            unread_count: row.unread_count.max(0),
             is_archived: row.is_archived,
             is_pinned: row.is_pinned,
             is_muted: row.is_muted,
@@ -2265,6 +2302,82 @@ fn normalize_message_type(value: i16) -> Result<i16, ApiError> {
             "message_type must be 1 or 3".to_string(),
         )),
     }
+}
+
+#[derive(Clone)]
+struct NormalizedPendingEventSummary {
+    event_type: String,
+    preview_text: Option<String>,
+    target_client_message_id: Option<Uuid>,
+}
+
+fn normalize_pending_event_summary(
+    value: Option<PendingEventSummaryRequest>,
+) -> Result<Option<NormalizedPendingEventSummary>, ApiError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let event_type = value.event_type.trim().to_lowercase();
+    match event_type.as_str() {
+        "message" | "edit" | "delete" | "receipt" => {}
+        _ => {
+            return Err(ApiError::BadRequest(
+                "event_summary.event_type is invalid".to_string(),
+            ));
+        }
+    }
+
+    let preview_text = value.preview_text.map(|text| {
+        let trimmed = text.trim().to_string();
+        if trimmed.chars().count() > 280 {
+            trimmed.chars().take(280).collect()
+        } else {
+            trimmed
+        }
+    });
+
+    Ok(Some(NormalizedPendingEventSummary {
+        event_type,
+        preview_text: preview_text.and_then(non_empty_or_none),
+        target_client_message_id: value.target_client_message_id,
+    }))
+}
+
+async fn record_e2ee_chat_event(
+    db: &PgPool,
+    chat_id: Uuid,
+    sender_user_id: Uuid,
+    sender_device_id: Uuid,
+    event_client_message_id: Uuid,
+    summary: NormalizedPendingEventSummary,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        insert into public.e2ee_chat_events (
+            chat_id,
+            sender_user_id,
+            sender_device_id,
+            event_client_message_id,
+            event_type,
+            preview_text,
+            target_client_message_id
+        )
+        values ($1, $2, $3, $4, $5, $6, $7)
+        on conflict (sender_device_id, event_client_message_id) do nothing
+        "#,
+    )
+    .bind(chat_id)
+    .bind(sender_user_id)
+    .bind(sender_device_id)
+    .bind(event_client_message_id)
+    .bind(summary.event_type)
+    .bind(summary.preview_text)
+    .bind(summary.target_client_message_id)
+    .execute(db)
+    .await?;
+
+    Ok(())
 }
 
 fn normalize_platform(value: String) -> Result<String, ApiError> {

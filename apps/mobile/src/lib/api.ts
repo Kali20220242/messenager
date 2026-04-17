@@ -115,6 +115,11 @@ export type E2EEPendingMessageEnvelope = {
   message_type: number;
   ciphertext: string;
   client_message_id?: string | null;
+  event_summary?: {
+    event_type: "message" | "edit" | "delete" | "receipt";
+    preview_text?: string | null;
+    target_client_message_id?: string | null;
+  };
 };
 
 type ApiMethod = "GET" | "POST" | "PATCH" | "DELETE";
@@ -296,6 +301,12 @@ export function updateChatPreferences(
   return apiRequest<ChatSummary>(`/chats/${chatId}/preferences`, {
     method: "PATCH",
     body: payload,
+  });
+}
+
+export function markChatRead(chatId: string) {
+  return apiRequest<void>(`/chats/${chatId}/read`, {
+    method: "POST",
   });
 }
 

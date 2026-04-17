@@ -32,6 +32,7 @@ import {
   discoverContacts,
   fetchChats,
   fetchMe,
+  markChatRead,
   openDirectChat,
   removePushToken,
   searchUserByUsername,
@@ -165,11 +166,13 @@ const mapLocalE2EEMessageToDraft = (message: LocalE2EEMessage): DraftMessage => 
   body: message.plaintext,
   created_at: new Date(message.createdAt).toISOString(),
   updated_at: new Date(message.ackedAt ?? message.deliveredAt ?? message.createdAt).toISOString(),
-  edited_at: null,
-  deleted_at: null,
-  receipt_status: message.direction === "outbound" ? "sent" : null,
-  reply_to: null,
-  forwarded_from: null,
+  edited_at: message.editedAt ? new Date(message.editedAt).toISOString() : null,
+  deleted_at: message.deletedAt ? new Date(message.deletedAt).toISOString() : null,
+  receipt_status: message.direction === "outbound"
+    ? (message.status === "delivered" || message.status === "seen" ? message.status : "sent")
+    : null,
+  reply_to: message.replyToPreview ? { body: message.replyToPreview } : null,
+  forwarded_from: message.forwardedFromPreview ? { body: message.forwardedFromPreview } : null,
 });
 
 const nativePlatform = (): "ios" | "android" | "web" =>
@@ -600,6 +603,11 @@ export default function App() {
       setChats((current) =>
         current.map((chat) => (chat.id === chatId ? { ...chat, unread_count: 0 } : chat)),
       );
+      await Promise.allSettled([
+        markChatRead(chatId),
+        e2eeChatService.markChatSeen(chatId, peerUserId),
+      ]);
+      await loadChats({ silent: true });
       setChatError(null);
     } catch (error) {
       if (!options?.silent) {
@@ -620,28 +628,7 @@ export default function App() {
         return;
       }
 
-      setChats((current) =>
-        sortChatsForDisplay(
-          current.map((chat) => {
-            const latestForChat = [...decryptedMessages]
-              .reverse()
-              .find((message) => message.chatId === chat.id);
-
-            if (!latestForChat) {
-              return chat;
-            }
-
-            const isCurrentlyOpen = options?.chatId === chat.id && currentScreen === "chat";
-            return {
-              ...chat,
-              last_message: latestForChat.plaintext,
-              last_message_at: new Date(latestForChat.createdAt).toISOString(),
-              activity_at: new Date(latestForChat.createdAt).toISOString(),
-              unread_count: isCurrentlyOpen ? 0 : chat.unread_count + 1,
-            };
-          }),
-        ),
-      );
+      await loadChats({ silent: true });
 
       if (options?.chatId && selectedChat?.peer.id) {
         await loadMessages(options.chatId, selectedChat.peer.id, {
@@ -919,9 +906,11 @@ export default function App() {
 
     try {
       await clearChatHistory(selectedChatId, scope);
+      await DB.deleteLocalE2EEMessagesForChat(selectedChatId);
       setMessages([]);
       setReplyingToMessage(null);
       setEditingMessage(null);
+      setForwardingMessage(null);
       await loadChats({ reset: true, silent: true });
       if (selectedChatId && selectedChat?.peer.id) {
         await loadMessages(selectedChatId, selectedChat.peer.id, { silent: true });
@@ -970,28 +959,127 @@ export default function App() {
     ]);
   };
 
-  const handleStartReply = (_message: DraftMessage) => {
-    setChatError("Reply is not wired for E2EE messages yet.");
+  const handleStartReply = (message: DraftMessage) => {
+    if (message.deleted_at) {
+      setChatError("You cannot reply to a deleted message.");
+      return;
+    }
+
+    setReplyingToMessage(message);
+    setEditingMessage(null);
+    setForwardingMessage(null);
+    setChatError(null);
   };
 
-  const handleStartEdit = (_message: DraftMessage) => {
-    setChatError("Edit is not wired for E2EE messages yet.");
+  const handleStartEdit = (message: DraftMessage) => {
+    if (message.sender_id !== currentUserId) {
+      setChatError("Only your own messages can be edited.");
+      return;
+    }
+
+    if (message.deleted_at) {
+      setChatError("You cannot edit a deleted message.");
+      return;
+    }
+
+    setEditingMessage(message);
+    setReplyingToMessage(null);
+    setForwardingMessage(null);
+    setDraft(message.body);
+    setChatError(null);
   };
 
-  const handleStartForward = (_message: DraftMessage) => {
-    setChatError("Forward is not wired for E2EE messages yet.");
+  const handleStartForward = (message: DraftMessage) => {
+    if (message.deleted_at) {
+      setChatError("You cannot forward a deleted message.");
+      return;
+    }
+
+    setForwardingMessage(message);
+    setReplyingToMessage(null);
+    setEditingMessage(null);
+    setDraft("");
+    setChatError(null);
   };
 
-  const runDeleteMessage = async (_message: DraftMessage, _scope: "self_only" | "everyone") => {
-    setChatError("Delete is not wired for E2EE messages yet.");
+  const runDeleteMessage = async (message: DraftMessage, scope: "self_only" | "everyone") => {
+    if (!selectedChatId || !selectedChat?.peer.id) {
+      return;
+    }
+
+    const localMessage = await DB.getLocalE2EEMessageByClientMessageId(message.id);
+    if (!localMessage) {
+      setChatError("Message was not found locally.");
+      return;
+    }
+
+    try {
+      if (scope === "everyone" && message.sender_id === currentUserId) {
+        await e2eeChatService.sendDeleteMessage({
+          peerUserId: selectedChat.peer.id,
+          chatId: selectedChatId,
+          targetClientMessageId: message.id,
+        });
+      } else {
+        await DB.deleteLocalE2EEMessageByClientMessageId(localMessage.clientMessageId ?? localMessage.id);
+      }
+
+      await loadMessages(selectedChatId, selectedChat.peer.id, { silent: true });
+      await loadChats({ silent: true });
+      setChatError(null);
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : "Failed to delete message.");
+    }
   };
 
-  const handleMessageActions = (_message: DraftMessage) => {
-    setChatError("Message actions are limited until E2EE edit/delete/forward flows are implemented.");
+  const handleMessageActions = (message: DraftMessage) => {
+    const isOwn = message.sender_id === currentUserId;
+    const buttons: AlertButton[] = [
+      {
+        text: "Reply",
+        onPress: () => handleStartReply(message),
+      },
+      {
+        text: "Forward",
+        onPress: () => handleStartForward(message),
+      },
+    ];
+
+    if (isOwn && !message.deleted_at) {
+      buttons.push({
+        text: "Edit",
+        onPress: () => handleStartEdit(message),
+      });
+      buttons.push({
+        style: "destructive",
+        text: "Delete for everyone",
+        onPress: () => {
+          void runDeleteMessage(message, "everyone");
+        },
+      });
+    }
+
+    buttons.push({
+      style: "destructive",
+      text: "Delete only for me",
+      onPress: () => {
+        void runDeleteMessage(message, "self_only");
+      },
+    });
+    buttons.push({
+      style: "cancel",
+      text: "Cancel",
+    });
+
+    Alert.alert("Message actions", "Choose what to do with this message.", buttons);
   };
 
   const handleSendMessage = async () => {
-    const body = draft.trim();
+    const body = editingMessage
+      ? draft.trim()
+      : forwardingMessage
+        ? (draft.trim() || forwardingMessage.body)
+        : draft.trim();
 
     if (!selectedChatId || !selectedChat?.peer.id || !body) {
       return;
@@ -1002,31 +1090,38 @@ export default function App() {
     setChatError(null);
 
     try {
-      await e2eeChatService.sendEncryptedMessage({
-        peerUserId: selectedChat.peer.id,
-        chatId: selectedChatId,
-        plaintext: body,
-      });
+      if (editingMessage) {
+        await e2eeChatService.sendEditMessage({
+          peerUserId: selectedChat.peer.id,
+          chatId: selectedChatId,
+          targetClientMessageId: editingMessage.id,
+          plaintext: body,
+        });
+      } else {
+        await e2eeChatService.sendEncryptedMessage({
+          peerUserId: selectedChat.peer.id,
+          chatId: selectedChatId,
+          plaintext: body,
+          replyToMessage: replyingToMessage
+            ? {
+                clientMessageId: replyingToMessage.id,
+                preview: messageBodyCopy(replyingToMessage),
+              }
+            : null,
+          forwardedFromMessage: forwardingMessage
+            ? {
+                clientMessageId: forwardingMessage.id,
+                preview: messageBodyCopy(forwardingMessage),
+              }
+            : null,
+        });
+      }
       setDraft("");
       await loadMessages(selectedChatId, selectedChat.peer.id, { silent: true });
-      setChats((current) =>
-        sortChatsForDisplay(
-          current.map((chat) =>
-            chat.id === selectedChatId
-              ? {
-                  ...chat,
-                  last_message: body,
-                  last_message_at: new Date().toISOString(),
-                  activity_at: new Date().toISOString(),
-                }
-              : chat,
-          ),
-        ),
-      );
       setReplyingToMessage(null);
       setForwardingMessage(null);
       setEditingMessage(null);
-      void loadChats({ silent: true });
+      await loadChats({ silent: true });
       resetRealtimeTimer();
     } catch (error) {
       setChatError(error instanceof Error ? error.message : "Failed to send message.");
@@ -1655,7 +1750,7 @@ export default function App() {
           style={styles.composerInput}
           value={draft}
           onChangeText={setDraft}
-          editable={!forwardingMessage || Boolean(editingMessage)}
+          editable
           placeholder={
             editingMessage
               ? "Edit message"
