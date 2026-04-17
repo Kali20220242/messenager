@@ -12,6 +12,62 @@ type SignedPreKeyRow = {
   signature: string;
 };
 
+type LocalDeviceStateRow = {
+  user_id: string;
+  device_id: string;
+  signal_device_id: number | null;
+  updated_at: number;
+};
+
+type LocalE2EEMessageRow = {
+  id: string;
+  pending_message_id: string | null;
+  client_message_id: string | null;
+  chat_id: string | null;
+  peer_user_id: string;
+  direction: string;
+  sender_user_id: string;
+  sender_device_id: string | null;
+  sender_signal_device_id: number | null;
+  receiver_device_id: string | null;
+  receiver_signal_device_id: number | null;
+  message_type: number;
+  ciphertext: string;
+  plaintext: string;
+  status: string;
+  created_at: number;
+  delivered_at: number | null;
+  acked_at: number | null;
+};
+
+export type LocalDeviceState = {
+  userId: string;
+  deviceId: string;
+  signalDeviceId: number | null;
+  updatedAt: number;
+};
+
+export type LocalE2EEMessage = {
+  id: string;
+  pendingMessageId?: string | null;
+  clientMessageId?: string | null;
+  chatId?: string | null;
+  peerUserId: string;
+  direction: "inbound" | "outbound";
+  senderUserId: string;
+  senderDeviceId?: string | null;
+  senderSignalDeviceId?: number | null;
+  receiverDeviceId?: string | null;
+  receiverSignalDeviceId?: number | null;
+  messageType: number;
+  ciphertext: string;
+  plaintext: string;
+  status: string;
+  createdAt: number;
+  deliveredAt?: number | null;
+  ackedAt?: number | null;
+};
+
 export class DatabaseService {
   private databasePromise: Promise<SQLite.SQLiteDatabase> | null = null;
   private initialized = false;
@@ -38,7 +94,6 @@ export class DatabaseService {
         chat_id TEXT NOT NULL,
         sender_id TEXT NOT NULL,
         ciphertext TEXT NOT NULL,
-        plaintext TEXT,
         created_at INTEGER NOT NULL,
         status TEXT NOT NULL
       );
@@ -46,6 +101,13 @@ export class DatabaseService {
       CREATE TABLE IF NOT EXISTS sessions (
         address TEXT PRIMARY KEY NOT NULL,
         session_data TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS local_device_state (
+        user_id TEXT PRIMARY KEY NOT NULL,
+        device_id TEXT NOT NULL UNIQUE,
+        signal_device_id INTEGER,
         updated_at INTEGER NOT NULL
       );
 
@@ -69,11 +131,43 @@ export class DatabaseService {
         updated_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS e2ee_messages (
+        id TEXT PRIMARY KEY NOT NULL,
+        pending_message_id TEXT,
+        client_message_id TEXT,
+        chat_id TEXT,
+        peer_user_id TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        sender_user_id TEXT NOT NULL,
+        sender_device_id TEXT,
+        sender_signal_device_id INTEGER,
+        receiver_device_id TEXT,
+        receiver_signal_device_id INTEGER,
+        message_type INTEGER NOT NULL,
+        ciphertext TEXT NOT NULL,
+        plaintext TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        delivered_at INTEGER,
+        acked_at INTEGER
+      );
+
       CREATE INDEX IF NOT EXISTS idx_messages_chat_id_created_at
       ON messages (chat_id, created_at DESC);
 
       CREATE INDEX IF NOT EXISTS idx_trusted_identities_address
       ON trusted_identities (address);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_e2ee_messages_pending_message_id
+      ON e2ee_messages (pending_message_id)
+      WHERE pending_message_id IS NOT NULL;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_e2ee_messages_client_message_id
+      ON e2ee_messages (client_message_id)
+      WHERE client_message_id IS NOT NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_e2ee_messages_peer_created_at
+      ON e2ee_messages (peer_user_id, created_at DESC);
     `);
 
     this.initialized = true;
@@ -134,6 +228,22 @@ export class DatabaseService {
     const database = await this.ready();
     const rows = await database.getAllAsync<{ id: number }>("SELECT id FROM prekeys ORDER BY id ASC");
     return rows.map((row) => row.id);
+  }
+
+  async countPreKeys(): Promise<number> {
+    const database = await this.ready();
+    return (
+      (await database.getFirstAsync<{ count: number }>("SELECT COUNT(*) as count FROM prekeys"))?.count
+      ?? 0
+    );
+  }
+
+  async getMaxPreKeyId(): Promise<number> {
+    const database = await this.ready();
+    return (
+      (await database.getFirstAsync<{ max_id: number | null }>("SELECT MAX(id) as max_id FROM prekeys"))?.max_id
+      ?? 0
+    );
   }
 
   async deletePreKey(id: number): Promise<void> {
@@ -228,6 +338,133 @@ export class DatabaseService {
     }));
   }
 
+  async saveLocalDeviceState(userId: string, deviceId: string, signalDeviceId: number | null): Promise<void> {
+    const database = await this.ready();
+    await database.runAsync(
+      `INSERT INTO local_device_state(user_id, device_id, signal_device_id, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET
+         device_id = excluded.device_id,
+         signal_device_id = excluded.signal_device_id,
+         updated_at = excluded.updated_at`,
+      userId,
+      deviceId,
+      signalDeviceId,
+      Date.now(),
+    );
+  }
+
+  async getLocalDeviceState(userId: string): Promise<LocalDeviceState | null> {
+    const database = await this.ready();
+    const row = await database.getFirstAsync<LocalDeviceStateRow>(
+      "SELECT user_id, device_id, signal_device_id, updated_at FROM local_device_state WHERE user_id = ?",
+      userId,
+    );
+
+    if (!row) {
+      return null;
+    }
+
+    return {
+      userId: row.user_id,
+      deviceId: row.device_id,
+      signalDeviceId: row.signal_device_id,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  async saveLocalE2EEMessage(message: LocalE2EEMessage): Promise<void> {
+    const database = await this.ready();
+    await database.runAsync(
+      `INSERT INTO e2ee_messages(
+         id,
+         pending_message_id,
+         client_message_id,
+         chat_id,
+         peer_user_id,
+         direction,
+         sender_user_id,
+         sender_device_id,
+         sender_signal_device_id,
+         receiver_device_id,
+         receiver_signal_device_id,
+         message_type,
+         ciphertext,
+         plaintext,
+         status,
+         created_at,
+         delivered_at,
+         acked_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         pending_message_id = excluded.pending_message_id,
+         client_message_id = excluded.client_message_id,
+         chat_id = excluded.chat_id,
+         peer_user_id = excluded.peer_user_id,
+         direction = excluded.direction,
+         sender_user_id = excluded.sender_user_id,
+         sender_device_id = excluded.sender_device_id,
+         sender_signal_device_id = excluded.sender_signal_device_id,
+         receiver_device_id = excluded.receiver_device_id,
+         receiver_signal_device_id = excluded.receiver_signal_device_id,
+         message_type = excluded.message_type,
+         ciphertext = excluded.ciphertext,
+         plaintext = excluded.plaintext,
+         status = excluded.status,
+         created_at = excluded.created_at,
+         delivered_at = excluded.delivered_at,
+         acked_at = excluded.acked_at`,
+      message.id,
+      message.pendingMessageId ?? null,
+      message.clientMessageId ?? null,
+      message.chatId ?? null,
+      message.peerUserId,
+      message.direction,
+      message.senderUserId,
+      message.senderDeviceId ?? null,
+      message.senderSignalDeviceId ?? null,
+      message.receiverDeviceId ?? null,
+      message.receiverSignalDeviceId ?? null,
+      message.messageType,
+      message.ciphertext,
+      message.plaintext,
+      message.status,
+      message.createdAt,
+      message.deliveredAt ?? null,
+      message.ackedAt ?? null,
+    );
+  }
+
+  async getLocalE2EEMessageByPendingId(pendingMessageId: string): Promise<LocalE2EEMessage | null> {
+    const database = await this.ready();
+    const row = await database.getFirstAsync<LocalE2EEMessageRow>(
+      "SELECT * FROM e2ee_messages WHERE pending_message_id = ?",
+      pendingMessageId,
+    );
+
+    return row ? this.mapLocalE2EEMessage(row) : null;
+  }
+
+  async listLocalE2EEMessages(peerUserId: string): Promise<LocalE2EEMessage[]> {
+    const database = await this.ready();
+    const rows = await database.getAllAsync<LocalE2EEMessageRow>(
+      "SELECT * FROM e2ee_messages WHERE peer_user_id = ? ORDER BY created_at ASC, id ASC",
+      peerUserId,
+    );
+
+    return rows.map((row) => this.mapLocalE2EEMessage(row));
+  }
+
+  async withTransaction<T>(task: () => Promise<T>): Promise<T> {
+    const database = await this.ready();
+    let result!: T;
+    await database.withTransactionAsync(async () => {
+      result = await task();
+    });
+    return result;
+  }
+
   private async ready(): Promise<SQLite.SQLiteDatabase> {
     await this.init();
     return this.getDatabase();
@@ -239,6 +476,29 @@ export class DatabaseService {
     }
 
     return this.databasePromise;
+  }
+
+  private mapLocalE2EEMessage(row: LocalE2EEMessageRow): LocalE2EEMessage {
+    return {
+      id: row.id,
+      pendingMessageId: row.pending_message_id,
+      clientMessageId: row.client_message_id,
+      chatId: row.chat_id,
+      peerUserId: row.peer_user_id,
+      direction: row.direction as LocalE2EEMessage["direction"],
+      senderUserId: row.sender_user_id,
+      senderDeviceId: row.sender_device_id,
+      senderSignalDeviceId: row.sender_signal_device_id,
+      receiverDeviceId: row.receiver_device_id,
+      receiverSignalDeviceId: row.receiver_signal_device_id,
+      messageType: row.message_type,
+      ciphertext: row.ciphertext,
+      plaintext: row.plaintext,
+      status: row.status,
+      createdAt: row.created_at,
+      deliveredAt: row.delivered_at,
+      ackedAt: row.acked_at,
+    };
   }
 }
 

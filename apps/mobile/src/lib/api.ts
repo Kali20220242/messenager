@@ -68,6 +68,7 @@ export type E2EEDeviceKeysUpload = {
 
 export type E2EEDeviceKeysResponse = {
   device_id: string;
+  signal_device_id: number;
   registration_id: number;
   uploaded_one_time_prekeys: number;
 };
@@ -85,6 +86,7 @@ export type E2EEOneTimePreKeyBundle = {
 
 export type E2EEDeviceBundle = {
   device_id: string;
+  signal_device_id: number;
   registration_id: number;
   identity_key: string;
   signed_prekey: E2EESignedPreKeyBundle;
@@ -95,7 +97,9 @@ export type E2EEPendingMessage = {
   id: string;
   sender_user_id: string;
   sender_device_id: string;
+  sender_signal_device_id: number;
   receiver_device_id: string;
+  receiver_signal_device_id: number;
   message_type: number;
   ciphertext: string;
   client_message_id?: string | null;

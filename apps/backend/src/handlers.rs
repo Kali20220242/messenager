@@ -213,6 +213,7 @@ struct OneTimePreKeyUpload {
 #[derive(Serialize)]
 struct DeviceKeysResponse {
     device_id: Uuid,
+    signal_device_id: i32,
     registration_id: i32,
     uploaded_one_time_prekeys: usize,
 }
@@ -220,6 +221,7 @@ struct DeviceKeysResponse {
 #[derive(Serialize, FromRow)]
 struct DeviceBundleRow {
     device_id: Uuid,
+    signal_device_id: i32,
     registration_id: i32,
     identity_key: String,
     signed_prekey_id: i32,
@@ -236,6 +238,7 @@ struct ClaimedOneTimePreKey {
 #[derive(Serialize)]
 struct DeviceBundleResponse {
     device_id: Uuid,
+    signal_device_id: i32,
     registration_id: i32,
     identity_key: String,
     signed_prekey: SignedPreKeyResponse,
@@ -269,7 +272,9 @@ struct PendingMessageRow {
     id: Uuid,
     sender_user_id: Uuid,
     sender_device_id: Uuid,
+    sender_signal_device_id: i32,
     receiver_device_id: Uuid,
+    receiver_signal_device_id: i32,
     message_type: i16,
     ciphertext: String,
     client_message_id: Option<Uuid>,
@@ -282,7 +287,9 @@ struct PendingMessageResponse {
     id: Uuid,
     sender_user_id: Uuid,
     sender_device_id: Uuid,
+    sender_signal_device_id: i32,
     receiver_device_id: Uuid,
+    receiver_signal_device_id: i32,
     message_type: i16,
     ciphertext: String,
     client_message_id: Option<Uuid>,
@@ -544,7 +551,7 @@ async fn upsert_device_keys(
 
     let mut tx = state.db.begin().await?;
 
-    sqlx::query(
+    let signal_device_id = sqlx::query_scalar::<_, i32>(
         r#"
         insert into public.e2ee_devices (
             id,
@@ -563,6 +570,7 @@ async fn upsert_device_keys(
             signed_prekey_public = excluded.signed_prekey_public,
             signed_prekey_signature = excluded.signed_prekey_signature,
             updated_at = timezone('utc', now())
+        returning signal_device_id
         "#,
     )
     .bind(payload.device_id)
@@ -572,21 +580,12 @@ async fn upsert_device_keys(
     .bind(payload.signed_prekey.key_id)
     .bind(signed_prekey_public)
     .bind(signed_prekey_signature)
-    .execute(tx.as_mut())
+    .fetch_one(tx.as_mut())
     .await?;
 
-    sqlx::query(
-        r#"
-        delete from public.e2ee_one_time_prekeys
-        where device_id = $1
-        "#,
-    )
-    .bind(payload.device_id)
-    .execute(tx.as_mut())
-    .await?;
-
+    let mut uploaded_one_time_prekeys = 0usize;
     for prekey in &one_time_prekeys {
-        sqlx::query(
+        let inserted = sqlx::query(
             r#"
             insert into public.e2ee_one_time_prekeys (
                 device_id,
@@ -594,6 +593,7 @@ async fn upsert_device_keys(
                 public_key
             )
             values ($1, $2, $3)
+            on conflict (device_id, key_id) do nothing
             "#,
         )
         .bind(payload.device_id)
@@ -601,14 +601,17 @@ async fn upsert_device_keys(
         .bind(&prekey.public_key)
         .execute(tx.as_mut())
         .await?;
+
+        uploaded_one_time_prekeys += inserted.rows_affected() as usize;
     }
 
     tx.commit().await?;
 
     Ok(Json(DeviceKeysResponse {
         device_id: payload.device_id,
+        signal_device_id,
         registration_id: payload.registration_id,
-        uploaded_one_time_prekeys: one_time_prekeys.len(),
+        uploaded_one_time_prekeys,
     }))
 }
 
@@ -624,6 +627,7 @@ async fn list_device_bundles(
         r#"
         select
             id as device_id,
+            signal_device_id,
             registration_id,
             identity_key,
             signed_prekey_id,
@@ -656,6 +660,7 @@ async fn list_device_bundles(
 
         bundles.push(DeviceBundleResponse {
             device_id: row.device_id,
+            signal_device_id: row.signal_device_id,
             registration_id: row.registration_id,
             identity_key: row.identity_key,
             signed_prekey: SignedPreKeyResponse {
@@ -685,25 +690,44 @@ async fn enqueue_pending_message(
 
     let row = sqlx::query_as::<_, PendingMessageRow>(
         r#"
-        insert into public.e2ee_pending_messages (
-            receiver_device_id,
-            sender_user_id,
-            sender_device_id,
-            message_type,
-            ciphertext,
-            client_message_id
+        with inserted as (
+            insert into public.e2ee_pending_messages (
+                receiver_device_id,
+                sender_user_id,
+                sender_device_id,
+                message_type,
+                ciphertext,
+                client_message_id
+            )
+            values ($1, $2, $3, $4, $5, $6)
+            returning
+                id,
+                sender_user_id,
+                sender_device_id,
+                receiver_device_id,
+                message_type,
+                ciphertext,
+                client_message_id,
+                created_at,
+                delivered_at
         )
-        values ($1, $2, $3, $4, $5, $6)
-        returning
-            id,
-            sender_user_id,
-            sender_device_id,
-            receiver_device_id,
-            message_type,
-            ciphertext,
-            client_message_id,
-            created_at,
-            delivered_at
+        select
+            inserted.id,
+            inserted.sender_user_id,
+            inserted.sender_device_id,
+            sender_device.signal_device_id as sender_signal_device_id,
+            inserted.receiver_device_id,
+            receiver_device.signal_device_id as receiver_signal_device_id,
+            inserted.message_type,
+            inserted.ciphertext,
+            inserted.client_message_id,
+            inserted.created_at,
+            inserted.delivered_at
+        from inserted
+        join public.e2ee_devices as sender_device
+          on sender_device.id = inserted.sender_device_id
+        join public.e2ee_devices as receiver_device
+          on receiver_device.id = inserted.receiver_device_id
         "#,
     )
     .bind(payload.receiver_device_id)
@@ -743,9 +767,24 @@ async fn list_pending_messages(
                 created_at,
                 delivered_at
         )
-        select *
+        select
+            updated.id,
+            updated.sender_user_id,
+            updated.sender_device_id,
+            sender_device.signal_device_id as sender_signal_device_id,
+            updated.receiver_device_id,
+            receiver_device.signal_device_id as receiver_signal_device_id,
+            updated.message_type,
+            updated.ciphertext,
+            updated.client_message_id,
+            updated.created_at,
+            updated.delivered_at
         from updated
-        order by created_at asc, id asc
+        join public.e2ee_devices as sender_device
+          on sender_device.id = updated.sender_device_id
+        join public.e2ee_devices as receiver_device
+          on receiver_device.id = updated.receiver_device_id
+        order by updated.created_at asc, updated.id asc
         "#,
     )
     .bind(device_id)
@@ -2125,7 +2164,9 @@ fn to_pending_message_response(row: PendingMessageRow) -> PendingMessageResponse
         id: row.id,
         sender_user_id: row.sender_user_id,
         sender_device_id: row.sender_device_id,
+        sender_signal_device_id: row.sender_signal_device_id,
         receiver_device_id: row.receiver_device_id,
+        receiver_signal_device_id: row.receiver_signal_device_id,
         message_type: row.message_type,
         ciphertext: row.ciphertext,
         client_message_id: row.client_message_id,

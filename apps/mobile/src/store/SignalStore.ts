@@ -22,6 +22,10 @@ type ProtocolBootstrapOptions = {
   preKeyCount?: number;
 };
 
+type AccountBootstrapOptions = {
+  signedPreKeyId?: number;
+};
+
 type PublishedPreKeyBundle = {
   registrationId: number;
   identityKey: ArrayBuffer;
@@ -107,20 +111,35 @@ export class SignalProtocolStore {
     installSignalRuntime();
   }
 
-  async initializeProtocolState(options: ProtocolBootstrapOptions = {}): Promise<{
+  async initializeAccountState(options: AccountBootstrapOptions = {}): Promise<{
     identityKeyPair: KeyPairType;
     registrationId: number;
     signedPreKey: SignedPreKeyPairType;
-    preKeys: PreKeyPairType[];
   }> {
     installSignalRuntime();
     await DB.init();
 
     const identityKeyPair = await this.ensureIdentityKeyPair();
     const registrationId = await this.ensureRegistrationId();
-
     const signedPreKeyId = options.signedPreKeyId ?? 1;
     const signedPreKey = await this.ensureSignedPreKey(identityKeyPair, signedPreKeyId);
+
+    return {
+      identityKeyPair,
+      registrationId,
+      signedPreKey,
+    };
+  }
+
+  async initializeProtocolState(options: ProtocolBootstrapOptions = {}): Promise<{
+    identityKeyPair: KeyPairType;
+    registrationId: number;
+    signedPreKey: SignedPreKeyPairType;
+    preKeys: PreKeyPairType[];
+  }> {
+    const { identityKeyPair, registrationId, signedPreKey } = await this.initializeAccountState({
+      signedPreKeyId: options.signedPreKeyId,
+    });
 
     const preKeyStartId = options.preKeyStartId ?? 1;
     const preKeyCount = options.preKeyCount ?? 100;
@@ -150,6 +169,30 @@ export class SignalProtocolStore {
         publicKey: preKey.keyPair.pubKey,
       })),
     };
+  }
+
+  async getRemainingPreKeyCount(): Promise<number> {
+    await DB.init();
+    return DB.countPreKeys();
+  }
+
+  async generatePreKeys(count: number): Promise<PreKeyPairType[]> {
+    if (count <= 0) {
+      return [];
+    }
+
+    await DB.init();
+    const startId = (await DB.getMaxPreKeyId()) + 1;
+    return this.ensurePreKeys(startId, count);
+  }
+
+  async replenishPreKeys(minimumRemaining: number, replenishCount: number): Promise<PreKeyPairType[]> {
+    const remaining = await this.getRemainingPreKeyCount();
+    if (remaining >= minimumRemaining) {
+      return [];
+    }
+
+    return this.generatePreKeys(replenishCount);
   }
 
   async getIdentityKeyPair(): Promise<KeyPairType | undefined> {
