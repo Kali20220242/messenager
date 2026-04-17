@@ -95,6 +95,7 @@ export type E2EEDeviceBundle = {
 
 export type E2EEPendingMessage = {
   id: string;
+  chat_id?: string | null;
   sender_user_id: string;
   sender_device_id: string;
   sender_signal_device_id: number;
@@ -110,6 +111,7 @@ export type E2EEPendingMessage = {
 export type E2EEPendingMessageEnvelope = {
   sender_device_id: string;
   receiver_device_id: string;
+  chat_id?: string | null;
   message_type: number;
   ciphertext: string;
   client_message_id?: string | null;

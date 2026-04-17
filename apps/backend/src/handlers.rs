@@ -262,6 +262,7 @@ struct OneTimePreKeyResponse {
 struct EnqueuePendingMessageRequest {
     sender_device_id: Uuid,
     receiver_device_id: Uuid,
+    chat_id: Option<Uuid>,
     message_type: i16,
     ciphertext: String,
     client_message_id: Option<Uuid>,
@@ -270,6 +271,7 @@ struct EnqueuePendingMessageRequest {
 #[derive(Serialize, FromRow)]
 struct PendingMessageRow {
     id: Uuid,
+    chat_id: Option<Uuid>,
     sender_user_id: Uuid,
     sender_device_id: Uuid,
     sender_signal_device_id: i32,
@@ -285,6 +287,7 @@ struct PendingMessageRow {
 #[derive(Serialize)]
 struct PendingMessageResponse {
     id: Uuid,
+    chat_id: Option<Uuid>,
     sender_user_id: Uuid,
     sender_device_id: Uuid,
     sender_signal_device_id: i32,
@@ -684,6 +687,10 @@ async fn enqueue_pending_message(
 ) -> Result<(StatusCode, Json<PendingMessageResponse>), ApiError> {
     ensure_device_ownership(&state.db, payload.sender_device_id, user.id).await?;
     ensure_device_exists(&state.db, payload.receiver_device_id).await?;
+    if let Some(chat_id) = payload.chat_id {
+        ensure_chat_membership(&state.db, chat_id, user.id).await?;
+        ensure_device_chat_membership(&state.db, payload.receiver_device_id, chat_id).await?;
+    }
 
     let ciphertext = normalize_key_material(payload.ciphertext, "ciphertext")?;
     let message_type = normalize_message_type(payload.message_type)?;
@@ -695,13 +702,15 @@ async fn enqueue_pending_message(
                 receiver_device_id,
                 sender_user_id,
                 sender_device_id,
+                chat_id,
                 message_type,
                 ciphertext,
                 client_message_id
             )
-            values ($1, $2, $3, $4, $5, $6)
+            values ($1, $2, $3, $4, $5, $6, $7)
             returning
                 id,
+                chat_id,
                 sender_user_id,
                 sender_device_id,
                 receiver_device_id,
@@ -713,6 +722,7 @@ async fn enqueue_pending_message(
         )
         select
             inserted.id,
+            inserted.chat_id,
             inserted.sender_user_id,
             inserted.sender_device_id,
             sender_device.signal_device_id as sender_signal_device_id,
@@ -733,11 +743,23 @@ async fn enqueue_pending_message(
     .bind(payload.receiver_device_id)
     .bind(user.id)
     .bind(payload.sender_device_id)
+    .bind(payload.chat_id)
     .bind(message_type)
     .bind(ciphertext)
     .bind(payload.client_message_id)
     .fetch_one(&state.db)
     .await?;
+
+    let push_tokens =
+        fetch_push_tokens_for_e2ee_delivery(&state.db, payload.receiver_device_id, payload.chat_id)
+            .await?;
+    if !push_tokens.is_empty() {
+        dispatch_e2ee_push_notifications(
+            state.http.clone(),
+            push_tokens,
+            payload.chat_id,
+        );
+    }
 
     Ok((StatusCode::CREATED, Json(to_pending_message_response(row))))
 }
@@ -758,6 +780,7 @@ async fn list_pending_messages(
               and acked_at is null
             returning
                 id,
+                chat_id,
                 sender_user_id,
                 sender_device_id,
                 receiver_device_id,
@@ -769,6 +792,7 @@ async fn list_pending_messages(
         )
         select
             updated.id,
+            updated.chat_id,
             updated.sender_user_id,
             updated.sender_device_id,
             sender_device.signal_device_id as sender_signal_device_id,
@@ -1442,6 +1466,37 @@ async fn ensure_device_exists(db: &PgPool, device_id: Uuid) -> Result<(), ApiErr
     }
 }
 
+async fn ensure_device_chat_membership(
+    db: &PgPool,
+    device_id: Uuid,
+    chat_id: Uuid,
+) -> Result<(), ApiError> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        r#"
+        select exists(
+            select 1
+            from public.e2ee_devices d
+            join public.chat_members cm
+              on cm.user_id = d.user_id
+            where d.id = $1
+              and cm.chat_id = $2
+        )
+        "#,
+    )
+    .bind(device_id)
+    .bind(chat_id)
+    .fetch_one(db)
+    .await?;
+
+    if exists {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden(
+            "receiver device user is not a member of the provided chat".to_string(),
+        ))
+    }
+}
+
 async fn consume_one_time_prekey(
     tx: &mut Transaction<'_, Postgres>,
     device_id: Uuid,
@@ -1896,6 +1951,37 @@ async fn fetch_push_tokens_for_chat(
     Ok(rows)
 }
 
+async fn fetch_push_tokens_for_e2ee_delivery(
+    db: &PgPool,
+    receiver_device_id: Uuid,
+    chat_id: Option<Uuid>,
+) -> Result<Vec<String>, ApiError> {
+    let rows = sqlx::query_scalar::<_, String>(
+        r#"
+        select distinct ud.expo_push_token
+        from public.user_devices ud
+        join public.e2ee_devices d
+          on d.user_id = ud.user_id
+        left join public.chat_members cm
+          on cm.user_id = d.user_id
+         and cm.chat_id = $2
+        where d.id = $1
+          and (
+              $2::uuid is null
+              or cm.user_id is null
+              or cm.muted_until is null
+              or cm.muted_until <= timezone('utc', now())
+          )
+        "#,
+    )
+    .bind(receiver_device_id)
+    .bind(chat_id)
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows)
+}
+
 fn dispatch_push_notifications(
     http: reqwest::Client,
     sender_name: String,
@@ -1929,6 +2015,42 @@ fn dispatch_push_notifications(
 
         if let Err(error) = result {
             tracing::warn!(error = ?error, "failed to send expo push notification");
+        }
+    });
+}
+
+fn dispatch_e2ee_push_notifications(
+    http: reqwest::Client,
+    push_tokens: Vec<String>,
+    chat_id: Option<Uuid>,
+) {
+    tokio::spawn(async move {
+        let payload: Vec<_> = push_tokens
+            .into_iter()
+            .map(|token| {
+                json!({
+                    "to": token,
+                    "sound": "default",
+                    "title": "New secure message",
+                    "body": "Open the app to decrypt it.",
+                    "data": {
+                        "event": "e2ee_pending",
+                        "chat_id": chat_id,
+                    },
+                })
+            })
+            .collect();
+
+        let result = http
+            .post("https://exp.host/--/api/v2/push/send")
+            .header("accept", "application/json")
+            .header("content-type", "application/json")
+            .json(&payload)
+            .send()
+            .await;
+
+        if let Err(error) = result {
+            tracing::warn!(error = ?error, "failed to send expo e2ee push notification");
         }
     });
 }
@@ -2162,6 +2284,7 @@ fn non_empty_or_none(value: String) -> Option<String> {
 fn to_pending_message_response(row: PendingMessageRow) -> PendingMessageResponse {
     PendingMessageResponse {
         id: row.id,
+        chat_id: row.chat_id,
         sender_user_id: row.sender_user_id,
         sender_device_id: row.sender_device_id,
         sender_signal_device_id: row.sender_signal_device_id,

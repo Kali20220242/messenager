@@ -456,6 +456,30 @@ export class DatabaseService {
     return rows.map((row) => this.mapLocalE2EEMessage(row));
   }
 
+  async listLocalE2EEMessagesForChat(chatId: string, peerUserId?: string): Promise<LocalE2EEMessage[]> {
+    const database = await this.ready();
+
+    const rows = peerUserId
+      ? await database.getAllAsync<LocalE2EEMessageRow>(
+        `SELECT *
+         FROM e2ee_messages
+         WHERE chat_id = ?
+            OR (chat_id IS NULL AND peer_user_id = ?)
+         ORDER BY created_at ASC, id ASC`,
+        chatId,
+        peerUserId,
+      )
+      : await database.getAllAsync<LocalE2EEMessageRow>(
+        `SELECT *
+         FROM e2ee_messages
+         WHERE chat_id = ?
+         ORDER BY created_at ASC, id ASC`,
+        chatId,
+      );
+
+    return rows.map((row) => this.mapLocalE2EEMessage(row));
+  }
+
   async withTransaction<T>(task: () => Promise<T>): Promise<T> {
     const database = await this.ready();
     let result!: T;

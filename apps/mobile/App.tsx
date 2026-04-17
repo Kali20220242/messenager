@@ -1,4 +1,5 @@
 import "react-native-url-polyfill/auto";
+import { DB, type LocalE2EEMessage } from "./src/database";
 
 import * as Contacts from "expo-contacts";
 import { StatusBar } from "expo-status-bar";
@@ -24,43 +25,53 @@ import {
 import { pickAndUploadAvatar, removeAvatarFiles, resolveAvatarUrl } from "./src/lib/avatar";
 import {
   type ClearChatScope,
-  type ChatMessage,
   type ChatSummary,
-  type DeleteMessageScope,
   type MeProfile,
-  type MessagePreview,
-  type ReceiptStatus,
   type UserProfile,
   clearChatHistory,
-  deleteMessage as deleteMessageRequest,
   discoverContacts,
-  editMessage as editMessageRequest,
   fetchChats,
   fetchMe,
-  fetchMessages,
   openDirectChat,
   removePushToken,
   searchUserByUsername,
   sendHeartbeat,
-  sendMessage as sendMessageRequest,
   updateChatPreferences,
   updateMyProfile,
   upsertPushToken,
 } from "./src/lib/api";
-import { registerForPushNotificationsAsync } from "./src/lib/notifications";
+import {
+  clearLastE2EEPushData,
+  getLastE2EEPushData,
+  registerForPushNotificationsAsync,
+  subscribeToE2EEPushWakeup,
+} from "./src/lib/notifications";
 import { normalizePhoneE164 } from "./src/lib/phone";
-import { supabase } from "./src/lib/supabase";
+import { e2eeChatService } from "./src/lib/e2ee";
+import { supabase } from "./src/supabase";
 import { useSessionStore } from "./src/store/session";
 
-type DraftMessage = ChatMessage & {
+type DraftMessage = {
+  id: string;
+  chat_id: string;
+  sender_id: string;
+  body: string;
+  created_at: string;
+  updated_at: string;
+  edited_at?: string | null;
+  deleted_at?: string | null;
+  receipt_status?: "sent" | "delivered" | "seen" | null;
+  reply_to?: { body: string } | null;
+  forwarded_from?: { body: string } | null;
   status?: "pending" | "failed";
   error?: string;
 };
 
+
+
 const REALTIME_IDLE_TIMEOUT_MS = 60_000;
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const CHAT_LIST_SYNC_INTERVAL_MS = 1_500;
-const CHAT_MESSAGES_SYNC_INTERVAL_MS = 1_000;
 const CHAT_PAGE_SIZE = 30;
 
 const isSessionError = (message: string) => {
@@ -128,20 +139,7 @@ const mergeChatSummaries = (current: ChatSummary[], incoming: ChatSummary[]) => 
   return sortChatsForDisplay([...nextById.values()]);
 };
 
-const mergeServerMessages = (current: DraftMessage[], incoming: ChatMessage[]) => {
-  const pendingMessages = current.filter(
-    (message) => message.status === "pending" || message.status === "failed",
-  );
-  const incomingIds = new Set(incoming.map((message) => message.id));
-  const merged = [
-    ...incoming,
-    ...pendingMessages.filter((message) => !incomingIds.has(message.id)),
-  ];
-
-  return merged.sort((left, right) => left.created_at.localeCompare(right.created_at));
-};
-
-const receiptCopy = (status: ReceiptStatus | null | undefined) => {
+const receiptCopy = (status: DraftMessage["receipt_status"]) => {
   switch (status) {
     case "seen":
       return "Seen";
@@ -154,11 +152,25 @@ const receiptCopy = (status: ReceiptStatus | null | undefined) => {
   }
 };
 
-const messageBodyCopy = (message: Pick<ChatMessage, "body" | "deleted_at">) =>
+const messageBodyCopy = (message: Pick<DraftMessage, "body" | "deleted_at">) =>
   message.deleted_at ? "Message deleted" : message.body;
 
-const previewBodyCopy = (preview: MessagePreview | null | undefined) =>
-  preview?.is_deleted ? "Deleted message" : preview?.body ?? "";
+const previewBodyCopy = (preview: { body: string } | null | undefined) =>
+  preview?.body ?? "";
+
+const mapLocalE2EEMessageToDraft = (message: LocalE2EEMessage): DraftMessage => ({
+  id: message.id,
+  chat_id: message.chatId ?? `local:${message.peerUserId}`,
+  sender_id: message.senderUserId,
+  body: message.plaintext,
+  created_at: new Date(message.createdAt).toISOString(),
+  updated_at: new Date(message.ackedAt ?? message.deliveredAt ?? message.createdAt).toISOString(),
+  edited_at: null,
+  deleted_at: null,
+  receipt_status: message.direction === "outbound" ? "sent" : null,
+  reply_to: null,
+  forwarded_from: null,
+});
 
 const nativePlatform = (): "ios" | "android" | "web" =>
   Platform.OS === "ios" ? "ios" : Platform.OS === "android" ? "android" : "web";
@@ -269,17 +281,18 @@ export default function App() {
   const [chatCursor, setChatCursor] = useState<string | null>(null);
   const [hasMoreChats, setHasMoreChats] = useState(true);
   const [appStateStatus, setAppStateStatus] = useState(AppState.currentState);
-  const [replyingToMessage, setReplyingToMessage] = useState<ChatMessage | null>(null);
-  const [editingMessage, setEditingMessage] = useState<ChatMessage | null>(null);
-  const [forwardingMessage, setForwardingMessage] = useState<ChatMessage | null>(null);
+  const [replyingToMessage, setReplyingToMessage] = useState<DraftMessage | null>(null);
+  const [editingMessage, setEditingMessage] = useState<DraftMessage | null>(null);
+  const [forwardingMessage, setForwardingMessage] = useState<DraftMessage | null>(null);
   const [isUpdatingChatPreferences, setIsUpdatingChatPreferences] = useState(false);
   const listRef = useRef<FlatList<DraftMessage>>(null);
-  const realtimeChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
   const realtimeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const chatListSyncRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const chatMessagesSyncRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pushTokenRef = useRef<string | null>(null);
+
+
+  
 
   const currentUserId = session?.user.id ?? null;
   const selectedChat = useMemo(
@@ -388,6 +401,44 @@ export default function App() {
   }, [session]);
 
   useEffect(() => {
+    if (!session) {
+      return;
+    }
+
+    void e2eeChatService.uploadMyKeys().catch((error) => {
+      console.warn("E2EE key upload failed", error);
+    });
+    void syncPendingE2EEMessages({ silent: true, chatId: selectedChatId }).catch(() => {});
+  }, [session, selectedChatId]);
+
+  useEffect(() => {
+    if (!session || Platform.OS === "web") {
+      return;
+    }
+
+    const lastPush = getLastE2EEPushData();
+    if (lastPush) {
+      void syncPendingE2EEMessages({
+        chatId: typeof lastPush.chat_id === "string" ? lastPush.chat_id : selectedChatId,
+        silent: true,
+      }).finally(() => {
+        clearLastE2EEPushData();
+      });
+    }
+
+    const unsubscribe = subscribeToE2EEPushWakeup((data) => {
+      void syncPendingE2EEMessages({
+        chatId: typeof data.chat_id === "string" ? data.chat_id : selectedChatId,
+        silent: true,
+      });
+    });
+
+    return () => {
+      unsubscribe();
+    };
+  }, [session, selectedChatId, selectedChat?.peer.id, currentScreen]);
+
+  useEffect(() => {
     if (!session || currentScreen !== "chat-list") {
       if (chatListSyncRef.current) {
         clearInterval(chatListSyncRef.current);
@@ -411,32 +462,19 @@ export default function App() {
   }, [session, currentScreen]);
 
   useEffect(() => {
-    if (!session || !selectedChatId || currentScreen !== "chat") {
-      if (chatMessagesSyncRef.current) {
-        clearInterval(chatMessagesSyncRef.current);
-        chatMessagesSyncRef.current = null;
-      }
+    if (!session || !selectedChatId || currentScreen !== "chat" || !selectedChat?.peer.id) {
       stopRealtime();
       return;
     }
 
-    void loadMessages(selectedChatId);
+    void loadMessages(selectedChatId, selectedChat.peer.id);
     void loadChats({ silent: true });
-    startRealtime(selectedChatId);
-
-    chatMessagesSyncRef.current = setInterval(() => {
-      void loadMessages(selectedChatId, { silent: true });
-      void loadChats({ silent: true });
-    }, CHAT_MESSAGES_SYNC_INTERVAL_MS);
+    setRealtimeStatus("live");
 
     return () => {
-      if (chatMessagesSyncRef.current) {
-        clearInterval(chatMessagesSyncRef.current);
-        chatMessagesSyncRef.current = null;
-      }
       stopRealtime();
     };
-  }, [session, selectedChatId, currentScreen]);
+  }, [session, selectedChatId, currentScreen, selectedChat?.peer.id]);
 
   useEffect(() => {
     listRef.current?.scrollToEnd({ animated: true });
@@ -446,11 +484,6 @@ export default function App() {
     if (chatListSyncRef.current) {
       clearInterval(chatListSyncRef.current);
       chatListSyncRef.current = null;
-    }
-
-    if (chatMessagesSyncRef.current) {
-      clearInterval(chatMessagesSyncRef.current);
-      chatMessagesSyncRef.current = null;
     }
 
     if (heartbeatRef.current) {
@@ -556,14 +589,14 @@ export default function App() {
     }
   };
 
-  const loadMessages = async (chatId: string, options?: { silent?: boolean }) => {
+  const loadMessages = async (chatId: string, peerUserId: string, options?: { silent?: boolean }) => {
     if (!options?.silent) {
       setIsLoadingMessages(true);
     }
 
     try {
-      const nextMessages = await fetchMessages(chatId);
-      setMessages((current) => mergeServerMessages(current, nextMessages));
+      const nextMessages = await DB.listLocalE2EEMessagesForChat(chatId, peerUserId);
+      setMessages(nextMessages.map(mapLocalE2EEMessageToDraft));
       setChats((current) =>
         current.map((chat) => (chat.id === chatId ? { ...chat, unread_count: 0 } : chat)),
       );
@@ -579,16 +612,55 @@ export default function App() {
     }
   };
 
+  const syncPendingE2EEMessages = async (options?: { chatId?: string | null; silent?: boolean }) => {
+    try {
+      const decryptedMessages = await e2eeChatService.pollAndDecryptPending();
+
+      if (decryptedMessages.length === 0) {
+        return;
+      }
+
+      setChats((current) =>
+        sortChatsForDisplay(
+          current.map((chat) => {
+            const latestForChat = [...decryptedMessages]
+              .reverse()
+              .find((message) => message.chatId === chat.id);
+
+            if (!latestForChat) {
+              return chat;
+            }
+
+            const isCurrentlyOpen = options?.chatId === chat.id && currentScreen === "chat";
+            return {
+              ...chat,
+              last_message: latestForChat.plaintext,
+              last_message_at: new Date(latestForChat.createdAt).toISOString(),
+              activity_at: new Date(latestForChat.createdAt).toISOString(),
+              unread_count: isCurrentlyOpen ? 0 : chat.unread_count + 1,
+            };
+          }),
+        ),
+      );
+
+      if (options?.chatId && selectedChat?.peer.id) {
+        await loadMessages(options.chatId, selectedChat.peer.id, {
+          silent: options.silent,
+        });
+      }
+    } catch (error) {
+      if (!options?.silent) {
+        setChatError(error instanceof Error ? error.message : "Failed to sync secure messages.");
+      }
+    }
+  };
+
   const resetRealtimeTimer = () => {
     if (realtimeTimeoutRef.current) {
       clearTimeout(realtimeTimeoutRef.current);
     }
 
     realtimeTimeoutRef.current = setTimeout(() => {
-      if (realtimeChannelRef.current) {
-        void supabase.removeChannel(realtimeChannelRef.current);
-        realtimeChannelRef.current = null;
-      }
       setRealtimeStatus("paused");
     }, REALTIME_IDLE_TIMEOUT_MS);
   };
@@ -599,78 +671,13 @@ export default function App() {
       realtimeTimeoutRef.current = null;
     }
 
-    if (realtimeChannelRef.current) {
-      void supabase.removeChannel(realtimeChannelRef.current);
-      realtimeChannelRef.current = null;
-    }
-
     setRealtimeStatus("off");
   };
 
-  const startRealtime = (chatId: string) => {
+  const startRealtime = (_chatId: string) => {
     stopRealtime();
-
-    const channel = supabase
-      .channel(`chat:${chatId}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "messages",
-          filter: `chat_id=eq.${chatId}`,
-        },
-        (payload) => {
-          const message = payload.new as ChatMessage;
-          setMessages((current) => {
-            if (current.some((item) => item.id === message.id)) {
-              return current;
-            }
-
-            return [...current, message];
-          });
-          setChats((current) =>
-            sortChatsForDisplay(
-              current.map((chat) =>
-                chat.id === chatId
-                  ? {
-                      ...chat,
-                      last_message: messageBodyCopy(message),
-                      last_message_at: message.created_at,
-                      activity_at: message.created_at,
-                      unread_count:
-                        message.sender_id === currentUserId ? chat.unread_count : chat.unread_count + 1,
-                    }
-                  : chat,
-              ),
-            ),
-          );
-          void loadChats({ silent: true });
-          resetRealtimeTimer();
-        },
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "UPDATE",
-          schema: "public",
-          table: "messages",
-          filter: `chat_id=eq.${chatId}`,
-        },
-        () => {
-          void loadMessages(chatId, { silent: true });
-          void loadChats({ silent: true });
-          resetRealtimeTimer();
-        },
-      )
-      .subscribe((status) => {
-        if (status === "SUBSCRIBED") {
-          setRealtimeStatus("live");
-          resetRealtimeTimer();
-        }
-      });
-
-    realtimeChannelRef.current = channel;
+    setRealtimeStatus("live");
+    resetRealtimeTimer();
   };
 
   const ensureRealtime = () => {
@@ -678,13 +685,7 @@ export default function App() {
       return;
     }
 
-    if (!realtimeChannelRef.current) {
-      startRealtime(selectedChatId);
-      return;
-    }
-
-    setRealtimeStatus("live");
-    resetRealtimeTimer();
+    startRealtime(selectedChatId);
   };
 
   const handleSendCode = async () => {
@@ -922,8 +923,8 @@ export default function App() {
       setReplyingToMessage(null);
       setEditingMessage(null);
       await loadChats({ reset: true, silent: true });
-      if (selectedChatId) {
-        await loadMessages(selectedChatId, { silent: true });
+      if (selectedChatId && selectedChat?.peer.id) {
+        await loadMessages(selectedChatId, selectedChat.peer.id, { silent: true });
       }
       setChatError(null);
     } catch (error) {
@@ -969,130 +970,30 @@ export default function App() {
     ]);
   };
 
-  const handleStartReply = (message: ChatMessage) => {
-    setReplyingToMessage(message);
-    setEditingMessage(null);
+  const handleStartReply = (_message: DraftMessage) => {
+    setChatError("Reply is not wired for E2EE messages yet.");
   };
 
-  const handleStartEdit = (message: ChatMessage) => {
-    if (message.deleted_at) {
-      return;
-    }
-
-    setEditingMessage(message);
-    setReplyingToMessage(null);
-    setForwardingMessage(null);
-    setDraft(message.body);
+  const handleStartEdit = (_message: DraftMessage) => {
+    setChatError("Edit is not wired for E2EE messages yet.");
   };
 
-  const handleStartForward = (message: ChatMessage) => {
-    if (message.deleted_at) {
-      return;
-    }
-
-    setForwardingMessage(message);
-    setReplyingToMessage(null);
-    setEditingMessage(null);
-    setDraft("");
-    stopRealtime();
-    clearSelectedChat();
-    startTransition(() => setCurrentScreen("chat-list"));
+  const handleStartForward = (_message: DraftMessage) => {
+    setChatError("Forward is not wired for E2EE messages yet.");
   };
 
-  const runDeleteMessage = async (message: ChatMessage, scope: DeleteMessageScope) => {
-    if (!selectedChatId) {
-      return;
-    }
-
-    try {
-      await deleteMessageRequest(selectedChatId, message.id, scope);
-      await loadMessages(selectedChatId, { silent: true });
-      await loadChats({ silent: true });
-      if (editingMessage?.id === message.id) {
-        setEditingMessage(null);
-        setDraft("");
-      }
-      if (replyingToMessage?.id === message.id) {
-        setReplyingToMessage(null);
-      }
-      setChatError(null);
-    } catch (error) {
-      setChatError(error instanceof Error ? error.message : "Failed to delete message.");
-    }
+  const runDeleteMessage = async (_message: DraftMessage, _scope: "self_only" | "everyone") => {
+    setChatError("Delete is not wired for E2EE messages yet.");
   };
 
-  const handleMessageActions = (message: ChatMessage) => {
-    const isOwnMessage = message.sender_id === currentUserId;
-    const canEdit = isOwnMessage && !message.deleted_at;
-    const canDeleteForEveryone = isOwnMessage;
-
-    if (Platform.OS === "web") {
-      const promptOnWeb = (globalThis as { prompt?: (message: string) => string | null }).prompt;
-      const action = promptOnWeb?.(
-        "Choose action: reply, forward, edit, delete_me, delete_everyone",
-      )?.trim().toLowerCase();
-
-      switch (action) {
-        case "reply":
-          handleStartReply(message);
-          break;
-        case "forward":
-          handleStartForward(message);
-          break;
-        case "edit":
-          if (canEdit) {
-            handleStartEdit(message);
-          }
-          break;
-        case "delete_me":
-          void runDeleteMessage(message, "self_only");
-          break;
-        case "delete_everyone":
-          if (canDeleteForEveryone) {
-            void runDeleteMessage(message, "everyone");
-          }
-          break;
-        default:
-          break;
-      }
-      return;
-    }
-
-    const actions: AlertButton[] = [
-      { text: "Reply", onPress: () => handleStartReply(message) },
-      { text: "Forward", onPress: () => handleStartForward(message) },
-    ];
-
-    if (canEdit) {
-      actions.push({ text: "Edit", onPress: () => handleStartEdit(message) });
-    }
-
-    actions.push({
-      text: "Delete for me",
-      onPress: () => {
-        void runDeleteMessage(message, "self_only");
-      },
-      style: "destructive" as const,
-    });
-
-    if (canDeleteForEveryone) {
-      actions.push({
-        text: "Delete for everyone",
-        onPress: () => {
-          void runDeleteMessage(message, "everyone");
-        },
-        style: "destructive" as const,
-      });
-    }
-
-    actions.push({ text: "Cancel", style: "cancel" as const });
-    Alert.alert("Message actions", undefined, actions);
+  const handleMessageActions = (_message: DraftMessage) => {
+    setChatError("Message actions are limited until E2EE edit/delete/forward flows are implemented.");
   };
 
   const handleSendMessage = async () => {
-    const body = forwardingMessage ? forwardingMessage.body.trim() : draft.trim();
+    const body = draft.trim();
 
-    if (!selectedChatId || !body) {
+    if (!selectedChatId || !selectedChat?.peer.id || !body) {
       return;
     }
 
@@ -1100,62 +1001,14 @@ export default function App() {
     setIsSendingMessage(true);
     setChatError(null);
 
-    const tempId = `temp-${Date.now()}`;
-    const optimisticMessage: DraftMessage = {
-      id: tempId,
-      chat_id: selectedChatId,
-      sender_id: currentUserId ?? "unknown",
-      body,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-      edited_at: null,
-      deleted_at: null,
-      receipt_status: "sent",
-      reply_to: replyingToMessage
-        ? {
-            id: replyingToMessage.id,
-            sender_id: replyingToMessage.sender_id,
-            body: previewBodyCopy(replyingToMessage.reply_to) || messageBodyCopy(replyingToMessage),
-            is_deleted: Boolean(replyingToMessage.deleted_at),
-          }
-        : null,
-      forwarded_from: forwardingMessage
-        ? {
-            id: forwardingMessage.id,
-            sender_id: forwardingMessage.sender_id,
-            body: messageBodyCopy(forwardingMessage),
-            is_deleted: Boolean(forwardingMessage.deleted_at),
-          }
-        : null,
-      status: "pending",
-    };
-
-    setDraft("");
-    if (!editingMessage) {
-      setMessages((current) => [...current, optimisticMessage]);
-    }
-
     try {
-      if (editingMessage) {
-        const saved = await editMessageRequest(selectedChatId, editingMessage.id, body);
-        setMessages((current) =>
-          current.map((message) => (message.id === editingMessage.id ? { ...message, ...saved } : message)),
-        );
-        setEditingMessage(null);
-      } else {
-        const saved = await sendMessageRequest(selectedChatId, {
-          body,
-          reply_to_message_id: replyingToMessage?.id ?? null,
-          forwarded_from_message_id: forwardingMessage?.id ?? null,
-        });
-        setMessages((current) => {
-          const next = current.map((message) => (message.id === tempId ? saved : message));
-          return next.filter(
-            (message, index, collection) =>
-              collection.findIndex((candidate) => candidate.id === message.id) === index,
-          );
-        });
-      }
+      await e2eeChatService.sendEncryptedMessage({
+        peerUserId: selectedChat.peer.id,
+        chatId: selectedChatId,
+        plaintext: body,
+      });
+      setDraft("");
+      await loadMessages(selectedChatId, selectedChat.peer.id, { silent: true });
       setChats((current) =>
         sortChatsForDisplay(
           current.map((chat) =>
@@ -1172,25 +1025,10 @@ export default function App() {
       );
       setReplyingToMessage(null);
       setForwardingMessage(null);
+      setEditingMessage(null);
       void loadChats({ silent: true });
-      void loadMessages(selectedChatId, { silent: true });
       resetRealtimeTimer();
     } catch (error) {
-      if (editingMessage) {
-        setDraft(body);
-      } else {
-        setMessages((current) =>
-          current.map((message) =>
-            message.id === tempId
-              ? {
-                  ...message,
-                  status: "failed",
-                  error: error instanceof Error ? error.message : "Failed to send message.",
-                }
-              : message,
-          ),
-        );
-      }
       setChatError(error instanceof Error ? error.message : "Failed to send message.");
     } finally {
       setIsSendingMessage(false);

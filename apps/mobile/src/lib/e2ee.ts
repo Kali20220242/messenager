@@ -47,6 +47,7 @@ export type SendEncryptedMessageInput = {
 
 export type DecryptedPendingMessage = {
   pendingMessageId: string;
+  chatId?: string | null;
   peerUserId: string;
   plaintext: string;
   createdAt: number;
@@ -138,6 +139,7 @@ export class E2EEChatService {
       await sendE2EEPendingMessage({
         sender_device_id: localDeviceState.deviceId,
         receiver_device_id: bundle.deviceId,
+        chat_id: input.chatId ?? null,
         message_type: encryptedMessage.type,
         ciphertext: encryptedMessage.body,
         client_message_id: clientMessageId,
@@ -206,6 +208,7 @@ export class E2EEChatService {
         id: pendingMessage.client_message_id ?? pendingMessage.id,
         pendingMessageId: pendingMessage.id,
         clientMessageId: pendingMessage.client_message_id ?? null,
+        chatId: pendingMessage.chat_id ?? null,
         peerUserId: pendingMessage.sender_user_id,
         direction: "inbound",
         senderUserId: pendingMessage.sender_user_id,
@@ -235,6 +238,7 @@ export class E2EEChatService {
 
       decryptedMessages.push({
         pendingMessageId: pendingMessage.id,
+        chatId: pendingMessage.chat_id ?? null,
         peerUserId: pendingMessage.sender_user_id,
         plaintext: decrypted,
         createdAt: storedMessage.createdAt,
